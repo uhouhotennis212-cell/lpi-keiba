@@ -710,7 +710,10 @@ if run_btn or (base_file and entry_file):
                 '予測ポジション':  (r['pos_pred']['icon'] + r['pos_pred']['zone_name']
                                     + r['pos_pred']['confidence'])
                                    if r.get('pos_pred') else '-',
-                '予測地点差':      round(r['pos_pred']['pred_gap'],2) if r.get('pos_pred') else '-',
+                '予測地点差':      round(r['pos_pred']['pred_gap'],1) if r.get('pos_pred') else '-',
+                '平均-3F差':       (f"{sum(r['pos_pred']['past_gaps'])/len(r['pos_pred']['past_gaps']):.1f}秒"
+                                    f"(n={r['pos_pred']['n_valid']})")
+                                   if r.get('pos_pred') and r['pos_pred']['past_gaps'] else '-',
                 '不利ボーナス':   bonus_str,
             })
 
