@@ -140,20 +140,26 @@ def get_pace_prediction(dist, venue, nige_count=0, senkou_count=0):
 # ============================================================
 
 POS_ZONE_LABELS = {
-    1: ('逃げ',  '0〜0.2秒', '#185FA5', '🟦'),
-    2: ('先行',  '0.3〜0.6秒','#3B6D11', '🟩'),
-    3: ('中団',  '0.7〜1.0秒','#BA7517', '🟨'),
-    4: ('後方',  '1.1秒〜',   '#A32D2D', '🟥'),
+    1: ('逃げ',  '平均0.1以下',  '#1A237E', '🟦'),
+    2: ('先行',  '0.2〜0.4秒',   '#1B5E20', '🟩'),
+    3: ('中団',  '0.5〜1.0秒',   '#E65100', '🟨'),
+    4: ('後方',  '1.1秒〜',      '#B71C1C', '🟥'),
 }
 
 def gap_to_zone(gap):
-    """地点差(秒) → ポジション帯番号"""
+    """
+    地点差(秒) → ポジション帯番号
+    1=逃げ（平均0.1以下）
+    2=先行（0.2〜0.4）
+    3=中団（0.5〜1.0）
+    4=後方（1.1〜）
+    """
     if gap is None or (isinstance(gap, float) and math.isnan(gap)):
         return None
-    if gap <= 0.2: return 1
-    if gap <= 0.6: return 2
-    if gap <= 1.0: return 3
-    return 4
+    if gap <= 0.1: return 1   # 逃げ：先頭からほぼ0
+    if gap <= 0.4: return 2   # 先行：0.2〜0.4秒
+    if gap <= 1.0: return 3   # 中団：0.5〜1.0秒
+    return 4                   # 後方：1.1秒〜
 
 def predict_position(past_gaps, rpci_pred=None):
     """
