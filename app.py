@@ -330,7 +330,15 @@ def apply_venue_bonus(venue, elem, lpi, strength=0.15):
 # ============================================================
 @st.cache_data
 def build_base_table(file_bytes):
-    df = pd.read_csv(io.BytesIO(file_bytes), encoding='shift_jis')
+    # エンコードを自動判定（shift_jis → cp932 → utf-8 の順で試行）
+    for enc in ['cp932', 'shift_jis', 'utf-8-sig', 'utf-8']:
+        try:
+            df = pd.read_csv(io.BytesIO(file_bytes), encoding=enc)
+            break
+        except (UnicodeDecodeError, Exception):
+            continue
+    else:
+        raise ValueError('CSVの文字コードを判定できませんでした')
     df['距離_num'] = df['距離'].str.extract(r'(\d+)').astype(float)
     df['上がり']   = pd.to_numeric(df['上り3F'], errors='coerce')
     df['競馬場']   = df['開催'].apply(get_venue_from_kaisan)
@@ -366,7 +374,14 @@ def get_z(agari, dist, venue, baba, base_dict, 稍重_dict):
 # ============================================================
 def calc_lpi(entry_bytes, base_dict, 稍重_dict,
              target_track='T', target_venue='東京', bonus_strength=0.15):
-    df = pd.read_csv(io.BytesIO(entry_bytes), encoding='shift_jis')
+    for enc in ['cp932', 'shift_jis', 'utf-8-sig', 'utf-8']:
+        try:
+            df = pd.read_csv(io.BytesIO(entry_bytes), encoding=enc)
+            break
+        except (UnicodeDecodeError, Exception):
+            continue
+    else:
+        raise ValueError('出走表CSVの文字コードを判定できませんでした')
 
     sex_map = {}
     age_map = {}
@@ -477,7 +492,7 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
         # ポジション予測（有効走の地点差から）
         past_gaps_for_pred = [r['gap_est'] for r in use
                                if r['gap_est'] < 5.0][:5]  # 大外れ値除外
-        pos_pred = predict_position(past_gaps_for_pred, pace['pred_rpci'] if 'pace' in dir() else None)
+        pos_pred = predict_position(past_gaps_for_pred, pace['pred_rpci'])
 
         results.append({
             'horse': horse, 'sex': sex, 'age': age,
@@ -501,7 +516,17 @@ def plot_ranking(results, race_name, target_venue):
     import matplotlib
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
-    matplotlib.rcParams['font.family'] = ['Hiragino Sans', 'Meiryo', 'sans-serif']
+    # 日本語フォントを環境に応じて自動選択
+    import matplotlib.font_manager as fm
+    jp_fonts = ['Noto Sans CJK JP','IPAexGothic','IPAPGothic',
+                'Hiragino Sans','Yu Gothic','Meiryo','MS Gothic']
+    available = {f.name for f in fm.fontManager.ttflist}
+    chosen = next((f for f in jp_fonts if f in available), None)
+    if chosen:
+        matplotlib.rcParams['font.family'] = chosen
+    else:
+        matplotlib.rcParams['font.family'] = 'DejaVu Sans'
+    matplotlib.rcParams['axes.unicode_minus'] = False
 
     names   = [r['horse'] for r in results]
     avgs_v  = [r['avg_venue_lpi'] for r in results]
@@ -518,7 +543,15 @@ def plot_ranking(results, race_name, target_venue):
             alpha=0.92, label=f'{target_venue}補正LPI')
     ax.axvline(80, color='#E24B4A', linestyle='--', linewidth=1, alpha=0.5)
     ax.set_yticks(y)
-    ax.set_yticklabels([f'{i+1}. {n}' for i,n in enumerate(names)], fontsize=9)
+    # 日本語フォントが見つからない場合は順位番号のみ表示
+    if chosen:
+        ax.set_yticklabels([f'{i+1}. {n}' for i,n in enumerate(names)], fontsize=9)
+    else:
+        ax.set_yticklabels([f'{i+1}.' for i in range(len(names))], fontsize=9)
+        # 代わりにグラフ右に馬名テキストを追加
+        for i, name in enumerate(names):
+            ax.text(56.5, i, name, va='center', fontsize=7,
+                    color='gray', fontfamily='DejaVu Sans')
     ax.set_xlabel('LPI スコア', fontsize=10)
     ax.set_xlim(55, 96)
     ax.set_title(f'{race_name}  [{target_venue}適合補正]  LPI v11', fontsize=12, fontweight='bold')
@@ -589,6 +622,9 @@ if not entry_file:
     st.stop()
 
 if run_btn or (base_file and entry_file):
+    # ペース予測（LPI計算内の pos_pred からも参照するため先に実行）
+    pace = get_pace_prediction(race_dist, target_venue, nige_count, senkou_count)
+
     with st.spinner('基準テーブルを構築中...'):
         base_dict, 稍重_dict = build_base_table(base_file.read())
         base_file.seek(0)  # 再読み込みのためリセット
@@ -609,7 +645,6 @@ if run_btn or (base_file and entry_file):
     st.success(f'✅ {len(results)}頭 計算完了')
 
     # ---- ペース予測バナー ----
-    pace = get_pace_prediction(race_dist, target_venue, nige_count, senkou_count)
     lamp_color = {'🟠': '#FFF3CD', '🔵': '#D6EAF8', '⚪': '#F8F9FA'}
     border_color = {'🟠': '#FAC775', '🔵': '#85C1E9', '⚪': '#DEE2E6'}
     bc = lamp_color.get(pace['lamp'], '#F8F9FA')
