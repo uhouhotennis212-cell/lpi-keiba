@@ -337,6 +337,11 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
 
     results.sort(key=lambda x: -x['avg_venue_lpi'])
     return results
+import matplotlib.pyplot as plt
+
+# 日本語フォントを指定（Google Colabや多くのLinux環境で利用可能なもの）
+plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Liberation Sans', 'IPAGothic']
 
 # ============================================================
 # グラフ描画
