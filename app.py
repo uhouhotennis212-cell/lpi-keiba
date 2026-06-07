@@ -180,7 +180,7 @@ def apply_venue_bonus(venue, elem, lpi, strength=0.15):
 # ============================================================
 @st.cache_data
 def build_base_table(file_bytes):
-    df = pd.read_csv(io.BytesIO(file_bytes), encoding='shift_jis')
+    df = pd.read_csv(io.BytesIO(file_bytes), encoding='cp932')
     df['距離_num'] = df['距離'].str.extract(r'(\d+)').astype(float)
     df['上がり']   = pd.to_numeric(df['上り3F'], errors='coerce')
     df['競馬場']   = df['開催'].apply(get_venue_from_kaisan)
