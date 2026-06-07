@@ -645,18 +645,18 @@ if run_btn or (base_file and entry_file):
     st.success(f'✅ {len(results)}頭 計算完了')
 
     # ---- ペース予測バナー ----
-    lamp_color = {'🟠': '#FFF3CD', '🔵': '#D6EAF8', '⚪': '#F8F9FA'}
-    border_color = {'🟠': '#FAC775', '🔵': '#85C1E9', '⚪': '#DEE2E6'}
-    bc = lamp_color.get(pace['lamp'], '#F8F9FA')
-    brd = border_color.get(pace['lamp'], '#DEE2E6')
+    lamp_color  = {'🟠': '#E65100', '🔵': '#0D47A1', '⚪': '#424242'}
+    border_color = {'🟠': '#FF6D00', '🔵': '#1565C0', '⚪': '#616161'}
+    bc  = lamp_color.get(pace['lamp'], '#424242')
+    brd = border_color.get(pace['lamp'], '#616161')
 
     adv_html = ''
     if pace['elem_adv']:
         adv_html = '  有利な要素型: **' + ' / '.join(pace['elem_adv']) + '**'
 
     st.markdown(
-        f"""<div style="background:{bc};border:1px solid {brd};border-radius:8px;
-        padding:12px 16px;margin:8px 0;font-size:13px;line-height:1.8">
+        f"""<div style="background:{bc};border:2px solid {brd};border-radius:8px;
+        padding:12px 16px;margin:8px 0;font-size:13px;line-height:1.8;color:#FFFFFF;font-weight:500">
         <b>{pace['lamp']} ペース予測: {pace['label']}</b>　
         予測RPCI <b>{pace['pred_rpci']:.1f}</b>（基準{pace['base_rpci']:.1f}±{pace['std']:.1f}）<br>
         スロー率 <b>{pace['slow_pct']}%</b>　ハイ率 <b>{pace['fast_pct']}%</b><br>
@@ -719,9 +719,14 @@ if run_btn or (base_file and entry_file):
 
         # カラーハイライト
         def highlight(row):
-            if row['順位'] == 1:   return ['background-color: #fff9c4'] * len(row)
-            if row['順位'] == 2:   return ['background-color: #f0f4ff'] * len(row)
-            if row['順位'] == 3:   return ['background-color: #fff0e6'] * len(row)
+            if row['順位'] == 1:
+                return ['background-color: #F9A825; color: #000000; font-weight: bold'] * len(row)
+            if row['順位'] == 2:
+                return ['background-color: #1565C0; color: #FFFFFF; font-weight: bold'] * len(row)
+            if row['順位'] == 3:
+                return ['background-color: #BF360C; color: #FFFFFF; font-weight: bold'] * len(row)
+            if row['順位'] <= 5:
+                return ['background-color: #1B1B2F; color: #E0E0E0'] * len(row)
             return [''] * len(row)
 
         st.dataframe(
@@ -729,6 +734,7 @@ if run_btn or (base_file and entry_file):
                 .apply(highlight, axis=1)
                 .format({lpi_col: '{:.1f}', 'LPI基本': '{:.1f}',
                          'LPI最高': '{:.1f}', 'LPI直近': '{:.1f}', '係数': '{:.2f}'})
+                .set_properties(**{'border': '1px solid #444', 'font-size': '13px'})
                 .hide(axis='index'),
             use_container_width=True,
             height=min(600, 45 + len(rows) * 38),
