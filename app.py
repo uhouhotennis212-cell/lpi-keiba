@@ -1009,8 +1009,11 @@ if run_btn or (base_file and entry_file):
 
         fmt = {lpi_col: '{:.1f}', 'LPI基本': '{:.1f}',
                'LPI最高': '{:.1f}', 'LPI直近': '{:.1f}', '係数': '{:.2f}'}
+        # 予測通過Tは数値と'-'が混在するためformat辞書には入れず事前に文字列化
         if '予測通過T' in result_df.columns:
-            fmt['予測通過T'] = '{:.2f}'
+            result_df['予測通過T'] = result_df['予測通過T'].apply(
+                lambda x: f'{x:.2f}' if isinstance(x, (int, float)) and x != '-' else '-'
+            )
 
         st.dataframe(
             result_df.style
