@@ -589,7 +589,7 @@ def apply_venue_bonus(venue, elem, lpi, strength=0.15):
 # ============================================================
 @st.cache_data
 def build_base_table(file_bytes):
-    # エンコードを自動判定（shift_jis → cp932 → utf-8 の順で試行）
+    # エンコードを自動判定
     for enc in ['cp932', 'shift_jis', 'utf-8-sig', 'utf-8']:
         try:
             df = pd.read_csv(io.BytesIO(file_bytes), encoding=enc)
@@ -598,19 +598,90 @@ def build_base_table(file_bytes):
             continue
     else:
         raise ValueError('CSVの文字コードを判定できませんでした')
+
     df['距離_num'] = df['距離'].str.extract(r'(\d+)').astype(float)
     df['上がり']   = pd.to_numeric(df['上り3F'], errors='coerce')
     df['競馬場']   = df['開催'].apply(get_venue_from_kaisan)
     df['馬場']     = df['馬場状態'].str.strip()
+    df['日付_num'] = pd.to_numeric(df['日付'], errors='coerce')
+    df['年']       = (df['日付_num'] // 10000).fillna(0).astype(int)
+    df['レース名_s'] = df['レース名'].str.strip() if 'レース名' in df.columns else ''
+
+    # ===== 年度重み（直近ほど重い）=====
+    def yr_weight(y):
+        try: y = int(y)
+        except: return 1.0
+        return 2.0 if y >= 25 else (1.5 if y >= 23 else 1.0)
+    df['yr_w'] = df['年'].apply(yr_weight)
+
     valid = df[df['馬場'].isin(['良', '稍'])].copy()
-    stats = valid.groupby(['距離_num','競馬場','馬場'])['上がり'].agg(
-        avg='mean', std='std', n='count').reset_index()
+
+    # 年度重み付き平均・std
+    def weighted_stats(g):
+        v = g.dropna(subset=['上がり'])
+        if len(v) == 0:
+            return pd.Series({'avg': np.nan, 'std': np.nan, 'n': 0})
+        w = v['yr_w']
+        wsum = w.sum()
+        wavg = (v['上がり'] * w).sum() / wsum
+        wvar = (w * (v['上がり'] - wavg) ** 2).sum() / wsum
+        return pd.Series({'avg': wavg, 'std': max(np.sqrt(wvar), 0.3), 'n': len(v)})
+
+    stats = valid.groupby(['距離_num', '競馬場', '馬場']).apply(weighted_stats).reset_index()
     stats = stats[stats['n'] >= 5]
     良_s  = stats[stats['馬場'] == '良']
     稍_s  = stats[stats['馬場'] == '稍']
-    base_dict  = {(r['距離_num'], r['競馬場']): (r['avg'], r['std']) for _, r in 良_s.iterrows()}
-    稍重_dict  = {(r['距離_num'], r['競馬場']): (r['avg'], r['std']) for _, r in 稍_s.iterrows()}
-    return base_dict, 稍重_dict
+    base_dict = {(r['距離_num'], r['競馬場']): (r['avg'], r['std']) for _, r in 良_s.iterrows()}
+    稍重_dict = {(r['距離_num'], r['競馬場']): (r['avg'], r['std']) for _, r in 稍_s.iterrows()}
+
+    # ===== 同名レース＋直近重み付き基準辞書 =====
+    def normalize_name(n):
+        return re.sub(r'[ＨＧＳＬ０-９G0-9HLS\s\u3000・Ｐ]', '', str(n))
+
+    race_base_dict = {}
+    vg = valid[valid['馬場'] == '良'].copy()
+    if len(vg) > 0 and '日付_num' in vg.columns:
+        race_avgs = vg.groupby(
+            ['距離_num', '競馬場', '日付_num', 'レース名_s', '年']
+        )['上がり'].agg(avg='mean', n='count').reset_index()
+        race_avgs = race_avgs[race_avgs['n'] >= 5]
+
+        for (dist, venue), grp in race_avgs.groupby(['距離_num', '競馬場']):
+            grp = grp.sort_values('日付_num', ascending=False).reset_index(drop=True)
+            seen = set()
+            for _, row in grp.iterrows():
+                tname = normalize_name(row['レース名_s'])
+                if not tname or len(tname) < 2 or tname in seen:
+                    continue
+                seen.add(tname)
+
+                w_rows = []
+                for idx2, row2 in grp.iterrows():
+                    rname2 = normalize_name(row2['レース名_s'])
+                    yr_w2  = yr_weight(row2['年'])
+                    # 同名ボーナス
+                    if tname == rname2:
+                        name_w = 3.0
+                    elif len(tname) >= 3 and (tname[:3] in rname2 or rname2[:3] in tname):
+                        name_w = 2.0
+                    else:
+                        name_w = 1.0
+                    recency_w = max(0.3, 1.0 - idx2 * 0.08)
+                    w_rows.append((row2['avg'], yr_w2 * name_w * recency_w))
+
+                # 同名全件＋直近5件（他）
+                same  = [(a, w) for i, (a, w) in enumerate(w_rows)
+                         if normalize_name(grp.iloc[i]['レース名_s'])[:3] == tname[:3]]
+                other = [(a, w) for i, (a, w) in enumerate(w_rows)
+                         if normalize_name(grp.iloc[i]['レース名_s'])[:3] != tname[:3]][:5]
+                use = same + other
+                total_w = sum(w for _, w in use)
+                if total_w == 0:
+                    continue
+                wavg = sum(a * w for a, w in use) / total_w
+                race_base_dict[(float(dist), str(venue), tname)] = round(wavg, 3)
+
+    return base_dict, 稍重_dict, race_base_dict
 
 def get_z(agari, dist, venue, baba, base_dict, 稍重_dict,
           race_base=None, race_name=None):
