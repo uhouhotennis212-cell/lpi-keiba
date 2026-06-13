@@ -989,15 +989,22 @@ if run_btn or (base_file and entry_file):
         if '予測通過T' in result_df.columns:
             valid_t = result_df['予測通過T'].replace('-', None)
             result_df['通過T順位'] = pd.to_numeric(valid_t, errors='coerce').rank(
-                method='min', ascending=True).astype('Int64')
+                method='min', ascending=True).fillna(0).astype(int)
 
         def highlight_with_t(row):
             # 予測通過Tが最小（1位）→ 金色, 2位→青, 3位→銅
-            t_rank = row.get('通過T順位', None)
+            try:
+                t_rank = int(row.get('通過T順位', 0) or 0)
+            except (TypeError, ValueError):
+                t_rank = 0
             if t_rank == 1: return ['background-color: #F9A825; color: #000; font-weight:bold'] * len(row)
             if t_rank == 2: return ['background-color: #1565C0; color: #fff; font-weight:bold'] * len(row)
             if t_rank == 3: return ['background-color: #BF360C; color: #fff; font-weight:bold'] * len(row)
-            if row.get('順位', 99) <= 5: return ['background-color: #1B1B2F; color: #E0E0E0'] * len(row)
+            try:
+                lpi_rank = int(row.get('順位', 99) or 99)
+            except (TypeError, ValueError):
+                lpi_rank = 99
+            if lpi_rank <= 5: return ['background-color: #1B1B2F; color: #E0E0E0'] * len(row)
             return [''] * len(row)
 
         fmt = {lpi_col: '{:.1f}', 'LPI基本': '{:.1f}',
