@@ -38,7 +38,7 @@ FULL_VENUE = {
     '中京':'中京','福島':'福島','小倉':'小倉','札幌':'札幌','函館':'函館',
 }
 GRADE_BONUS  = {'G1':1.5,'G2':1.2,'G3':1.0,'L':0.9,'OP':0.8,'':0.7}
-GRADE_WEIGHT = {'G1':3.0,'G2':2.0,'G3':1.5,'L':1.0,'OP':1.0,'':0.8}
+GRADE_WEIGHT = {'G1':4.0,'G2':3.0,'G3':2.0,'L':1.5,'OP':0.6,'':0.5}
 RANK_BONUS_MULT       = {1:1.5, 2:1.2, 3:1.0}
 G1_PENALTY_THRESHOLD  = 0.7
 G1_PENALTY_COEF       = 0.70
@@ -403,16 +403,133 @@ def calc_front_pace_z(pci, agari, dist):
     # Z = (基準 - 実際) / std  → マイナスが速い
     return round((base_1f - front_1f) / std_1f, 3)
 
+
+def calc_pci_cs(past_runs, target_front_1f, tolerance_good=0.15, tolerance_near=0.30):
+    """
+    PCI追走スコア（PCI Chasing Score）
+
+    各馬の過去走PCIから前半1F平均を逆算し、
+    ターゲット前半速度（逃げ馬が作るペース）への対応実績を評価する。
+
+    Args:
+        past_runs:        過去走データのリスト（run_dataのdict）
+        target_front_1f:  逃げ馬が作る想定前半1F平均（秒）
+        tolerance_good:   「ほぼ同じ」とみなす誤差範囲（デフォルト±0.15秒）
+        tolerance_near:   「近い」とみなす誤差範囲（デフォルト±0.30秒）
+
+    Returns:
+        dict: {
+          'score':      PCI-CS スコア（プラス=追走能力高）,
+          'judge':      '◎'/'○'/'△'/'×',
+          'fastest_1f': 過去走での最速前半1F,
+          'best_run':   最も速い前半で好走したレース名,
+          'n_fast':     ターゲット以上の前半経験走数,
+          'detail':     詳細文字列,
+        }
+    """
+    valid_runs = []
+    for r in past_runs:
+        if r.get('excluded_baba') or r.get('excluded_track'):
+            continue
+        pci = r.get('pci')
+        agari = r.get('agari')
+        if pci is None or agari is None:
+            continue
+        try:
+            pci_f = float(pci); agari_f = float(agari)
+            if math.isnan(pci_f) or math.isnan(agari_f):
+                continue
+        except:
+            continue
+        # PCIから前半1F平均を逆算
+        ave3f = (pci_f + 50) * agari_f / 100
+        front_1f = ave3f / 3
+        valid_runs.append({
+            'race':     r.get('race', ''),
+            'front_1f': front_1f,
+            'rank':     r.get('rank_int'),
+            'agari':    agari_f,
+            'pci':      pci_f,
+        })
+
+    if not valid_runs:
+        return {'score': 0.0, 'judge': '△', 'fastest_1f': None,
+                'best_run': None, 'n_fast': 0, 'detail': 'PCIデータなし'}
+
+    score = 0.0
+    best_run = None
+    detail_parts = []
+
+    for r in valid_runs:
+        diff = target_front_1f - r['front_1f']  # プラス=ターゲット以上の前半経験
+        rank = r['rank']
+
+        if diff >= 0:  # ターゲット以上に速い前半を経験済み
+            if rank and rank <= 3:
+                s = min(3.0, diff * 10 + 2.0)
+                score += s
+                if best_run is None or r['front_1f'] < best_run['front_1f']:
+                    best_run = r
+                mark = '✅'
+            elif rank and rank <= 6:
+                score += min(1.0, diff * 5) * 0.3
+                mark = '△'
+            else:
+                score -= 0.5  # 速いペースで大敗
+                mark = '❌'
+            detail_parts.append(f'{r["race"][:8]}(1F={r["front_1f"]:.3f},{rank}着{mark})')
+
+        elif diff >= -tolerance_good:  # ほぼ同じ速度
+            if rank and rank <= 3:
+                score += 1.0
+                mark = '✅近'
+            elif rank and rank <= 6:
+                score += 0.2
+                mark = '△近'
+            else:
+                mark = ''
+            if mark:
+                detail_parts.append(f'{r["race"][:8]}(1F={r["front_1f"]:.3f},{rank}着{mark})')
+
+        elif diff >= -tolerance_near:  # やや遅い前半
+            if rank and rank <= 3:
+                score += 0.3
+
+    # 速い前半経験が全くない場合はペナルティ
+    fastest = min(r['front_1f'] for r in valid_runs)
+    n_fast  = sum(1 for r in valid_runs if r['front_1f'] <= target_front_1f + tolerance_good)
+    if fastest > target_front_1f + tolerance_near:
+        score -= 1.5
+        detail_parts.append(f'最速前半={fastest:.3f}秒/F（経験不足）')
+
+    score = round(score, 2)
+    if score >= 2.0:   judge = '◎'
+    elif score >= 0.5: judge = '○'
+    elif score >= -0.5: judge = '△'
+    else:              judge = '×'
+
+    detail = ' / '.join(detail_parts[:3]) if detail_parts else f'最速={fastest:.3f}秒/F'
+    best_name = best_run['race'][:10] if best_run else None
+
+    return {
+        'score':      score,
+        'judge':      judge,
+        'fastest_1f': round(fastest, 3),
+        'best_run':   best_name,
+        'n_fast':     n_fast,
+        'detail':     detail,
+    }
+
 WALK_DEFS = [
     {'n':1,'agari':'上り3F',  'rpci':'RPCI',  'venue':'場所',  'dist':'距離',
      'baba':'馬場状態',  'rank':'着順',  'race':'ﾚｰｽ名･1走前','td':'TD','gap':'-3F差'},
-    {'n':2,'agari':'上り3F.1','rpci':'RPCI.1','venue':'場所.1','dist':'距離.1',
+    {'n':2,'agari':'上り3F.1','rpci':'RPCI.1','pci':'PCI.1','venue':'場所.1','dist':'距離.1',
      'baba':'馬場状態.1','rank':'着順.1','race':'ﾚｰｽ名･2走前','td':'TD.1','gap':'-3F差.1'},
-    {'n':3,'agari':'上り3F.2','rpci':'RPCI.2','venue':'場所.2','dist':'距離.2',
+    {'n':3,'agari':'上り3F.2','rpci':'RPCI.2','pci':'PCI.2','venue':'場所.2','dist':'距離.2',
      'baba':'馬場状態.2','rank':'着順.2','race':'ﾚｰｽ名･3走前','td':'TD.2','gap':'-3F差.2'},
-    {'n':4,'agari':'上り3F.3','rpci':'RPCI.3','venue':'場所.3','dist':'距離.3',
+    {'n':4,'agari':'上り3F.3','rpci':'RPCI.3','pci':'PCI.3','venue':'場所.3','dist':'距離.3',
      'baba':'馬場状態.3','rank':'着順.3','race':'ﾚｰｽ名･4走前','td':'TD.3','gap':'-3F差.3'},
-    {'n':5,'agari':'上り3F.4','rpci':'RPCI.4','venue':'場所.4','dist':'距離.4',
+    {'n':5,'agari':'上り3F.4','rpci':'RPCI.4','pci':'PCI.4','venue':'場所.4','dist':'距離.4',
      'baba':'馬場状態.4','rank':'着順.4','race':'ﾚｰｽ名･5走前','td':'TD.4','gap':'-3F差.4'},
 ]
 
@@ -762,6 +879,13 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
 
         coef = get_venue_bonus(target_venue, dom_elem)
 
+        # PCI追走スコア（逃げ馬ペースへの対応実績）
+        pci_cs_result = None
+        if pace_pred_rpci is not None:
+            # サイドバーのtarget_front_1fは外から渡せないので
+            # run_data に格納してUIで使う
+            pass
+
         # ポジション予測（有効走の地点差から）
         past_gaps_for_pred = [r['gap_est'] for r in use
                                if r['gap_est'] < 5.0][:5]  # 大外れ値除外
@@ -783,9 +907,29 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
             pred_gap            = _pred_gap,
         )
 
+        # ===== G1好走LPIボーナス（直近3走以内のG1好走に加算）=====
+        # G1_1着+3.0 / G1_2着+2.0 / G1_3着+1.0
+        G1_BONUS_TABLE = {1: 3.0, 2: 2.0, 3: 1.0}
+        g1_lpi_bonus = 0.0
+        g1_bonus_detail = []
+        for rn in run_data[:3]:   # 直近3走以内のみ
+            if rn['grade'] == 'G1' and rn['rank_int'] and rn['rank_int'] <= 3:
+                b = G1_BONUS_TABLE.get(rn['rank_int'], 0)
+                if b > 0:
+                    g1_lpi_bonus += b
+                    g1_bonus_detail.append(f"{rn['race']}_{rn['rank_int']}着+{b}")
+        g1_lpi_bonus = min(g1_lpi_bonus, 6.0)   # 上限6点
+
+        # ボーナスをLPIに加算（上限100）
+        avg_lpi_adj      = min(100.0, round(avg_lpi      + g1_lpi_bonus, 1))
+        avg_venue_lpi_adj = min(100.0, round(avg_venue   + g1_lpi_bonus, 1))
+
         results.append({
             'horse': horse, 'sex': sex, 'age': age,
-            'avg_lpi': avg_lpi, 'avg_venue_lpi': avg_venue,
+            'avg_lpi': avg_lpi_adj, 'avg_venue_lpi': avg_venue_lpi_adj,
+            'avg_lpi_raw': avg_lpi, 'avg_venue_raw': avg_venue,
+            'g1_lpi_bonus': round(g1_lpi_bonus, 1),
+            'g1_bonus_detail': ' / '.join(g1_bonus_detail),
             'max_lpi': round(max(r['lpi'] for r in run_data), 1),
             'latest_lpi': run_data[0]['lpi'],
             'n_valid': len(valid), 'n_total': len(run_data), 'n_good': len(good),
@@ -794,6 +938,7 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
             'pos_pred':   pos_pred,
             'agari_pred': agari_pred,
             'runs': run_data, 'valid_runs': valid, 'good_runs': good,
+            'pci_cs_runs': use[:5],  # PCI-CS計算用の有効走
         })
 
     results.sort(key=lambda x: -x['avg_venue_lpi'])
@@ -924,6 +1069,26 @@ with st.sidebar:
     else:  # S
         manual_rpci = 57.0   # S帯の代表値
 
+    st.subheader('⑤ PCI追走スコア（任意）')
+    use_pci_cs = st.checkbox(
+        '逃げ馬ペースへの追走能力を評価する',
+        value=False,
+        help='逃げ馬がいる場合、そのペースに対応できる馬を評価します'
+    )
+    if use_pci_cs:
+        target_front_1f = st.number_input(
+            '逃げ馬の想定前半1F（秒）',
+            min_value=10.5, max_value=13.5, value=11.9, step=0.05,
+            help='PCIから逆算: (PCI+50)×上がり/100/3\n'
+                 '例) タバル宝塚2025実績=11.892秒/F\n'
+                 '    大阪杯ペース目安=11.8秒/F'
+        )
+        st.caption(
+            f'ターゲット{target_front_1f:.3f}秒/F以下の前半を経験した馬を高評価'
+        )
+    else:
+        target_front_1f = None
+
     run_btn = st.button('🔍 LPI計算実行', type='primary', use_container_width=True)
 
 # ---- メインエリア ----
@@ -1011,11 +1176,20 @@ if run_btn or (base_file and entry_file):
         st.subheader(f'{race_name}  LPI v11 ランキング')
 
         # 表データ作成
+        # PCI-CS計算（サイドバーでtarget設定済みの場合）
+        pci_cs_map = {}
+        if use_pci_cs and target_front_1f:
+            for r in results:
+                cs = calc_pci_cs(r.get('pci_cs_runs', []), target_front_1f)
+                pci_cs_map[r['horse']] = cs
+
         rows = []
         for i, r in enumerate(results):
             bonus_runs = [rn for rn in r['runs'] if rn['hb'] > 0]
             bonus_str  = ' / '.join(
                 [f"{rn['race']}({rn['hb_r']})" for rn in bonus_runs])
+            g1_bonus_str = (f"+{r['g1_lpi_bonus']:.1f}({r['g1_bonus_detail']})"
+                           if r.get('g1_lpi_bonus', 0) > 0 else '-')
             past  = [rn for rn in r['runs']
                      if not rn['excluded_baba'] and not rn['excluded_track']][:5]
             plpi  = [round(rn['lpi'], 1) for rn in past]
@@ -1044,6 +1218,9 @@ if run_btn or (base_file and entry_file):
                 '4走前':          plpi[3],
                 '5走前':          plpi[4],
                 'ペース適合':      pace_mark,
+                'PCI追走':         (pci_cs_map[r['horse']]['judge'] + ' ' +
+                                    str(pci_cs_map[r['horse']]['score']))
+                                   if r['horse'] in pci_cs_map else '-',
                 '予測ポジション':  (r['pos_pred']['icon'] + r['pos_pred']['zone_name']
                                     + r['pos_pred']['confidence'])
                                    if r.get('pos_pred') else '-',
@@ -1058,6 +1235,7 @@ if run_btn or (base_file and entry_file):
                                    if r.get('agari_pred') else '-',
                 '予測上がり秒':    r['agari_pred']['pred_agari']
                                    if r.get('agari_pred') else '-',
+                'G1好走ボーナス': g1_bonus_str,
                 '不利ボーナス':   bonus_str,
             })
 
