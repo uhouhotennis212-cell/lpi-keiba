@@ -969,6 +969,8 @@ if run_btn or (base_file and entry_file):
                 '平均-3F差':       (f"{sum(r['pos_pred']['past_gaps'])/len(r['pos_pred']['past_gaps']):.1f}秒"
                                     f"(n={r['pos_pred']['n_valid']})")
                                    if r.get('pos_pred') and r['pos_pred']['past_gaps'] else '-',
+                '予測通過T':       round(r['pos_pred']['pred_gap'] + r['agari_pred']['pred_agari'], 2)
+                                   if r.get('pos_pred') and r.get('agari_pred') else '-',
                 '上がり予測':      (r['agari_pred']['grade_label']
                                     + ' ' + r['agari_pred']['confidence'])
                                    if r.get('agari_pred') else '-',
@@ -981,22 +983,32 @@ if run_btn or (base_file and entry_file):
         lpi_col   = f'LPI[{target_venue}補正]'
 
         # カラーハイライト
-        def highlight(row):
-            if row['順位'] == 1:
-                return ['background-color: #F9A825; color: #000000; font-weight: bold'] * len(row)
-            if row['順位'] == 2:
-                return ['background-color: #1565C0; color: #FFFFFF; font-weight: bold'] * len(row)
-            if row['順位'] == 3:
-                return ['background-color: #BF360C; color: #FFFFFF; font-weight: bold'] * len(row)
-            if row['順位'] <= 5:
-                return ['background-color: #1B1B2F; color: #E0E0E0'] * len(row)
+        # highlight関数はhighlight_with_tに統合
+
+        # 予測通過T順位を計算（小さい順）
+        if '予測通過T' in result_df.columns:
+            valid_t = result_df['予測通過T'].replace('-', None)
+            result_df['通過T順位'] = pd.to_numeric(valid_t, errors='coerce').rank(
+                method='min', ascending=True).astype('Int64')
+
+        def highlight_with_t(row):
+            # 予測通過Tが最小（1位）→ 金色, 2位→青, 3位→銅
+            t_rank = row.get('通過T順位', None)
+            if t_rank == 1: return ['background-color: #F9A825; color: #000; font-weight:bold'] * len(row)
+            if t_rank == 2: return ['background-color: #1565C0; color: #fff; font-weight:bold'] * len(row)
+            if t_rank == 3: return ['background-color: #BF360C; color: #fff; font-weight:bold'] * len(row)
+            if row.get('順位', 99) <= 5: return ['background-color: #1B1B2F; color: #E0E0E0'] * len(row)
             return [''] * len(row)
+
+        fmt = {lpi_col: '{:.1f}', 'LPI基本': '{:.1f}',
+               'LPI最高': '{:.1f}', 'LPI直近': '{:.1f}', '係数': '{:.2f}'}
+        if '予測通過T' in result_df.columns:
+            fmt['予測通過T'] = '{:.2f}'
 
         st.dataframe(
             result_df.style
-                .apply(highlight, axis=1)
-                .format({lpi_col: '{:.1f}', 'LPI基本': '{:.1f}',
-                         'LPI最高': '{:.1f}', 'LPI直近': '{:.1f}', '係数': '{:.2f}'})
+                .apply(highlight_with_t, axis=1)
+                .format(fmt, na_rep='-')
                 .set_properties(**{'border': '1px solid #444', 'font-size': '13px'})
                 .hide(axis='index'),
             use_container_width=True,
