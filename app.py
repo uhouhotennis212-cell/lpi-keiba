@@ -220,8 +220,24 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
             else:            pace = 'M'
         else:
             pace = 'M'  # 不明はミドル扱い
-        z_by_pace[pace].append(z)
-        all_z_list.append(z)
+
+        # 前半ペースZスコア: マイナスほど速い前半
+        fp_z = r.get('front_pace_z')
+        # 「前半が速いレース（fp_z<-0.3）でもZが高い馬」= 追走能力が高い
+        # ボーナス: 速い前半（fp_z<-0.3）でZ>+0.3 → 追走能力加算
+        chase_bonus = 0.0
+        if fp_z is not None and not math.isnan(float(fp_z)):
+            fp_z_f = float(fp_z)
+            if fp_z_f < -0.3 and z > 0.3:
+                # 速い前半×速い上がり → 追走能力ボーナス
+                # 係数: fp_zが速いほど・zが高いほど大きい
+                chase_bonus = round(min(abs(fp_z_f) * z * 0.15, 0.4), 3)
+            elif fp_z_f > 0.3 and z > 0.5:
+                # 遅い前半×速い上がり → わずかにペナルティ（スロー展開の恩恵）
+                chase_bonus = round(-min(fp_z_f * 0.05, 0.1), 3)
+
+        z_by_pace[pace].append(z + chase_bonus)
+        all_z_list.append(z + chase_bonus)
 
     if not all_z_list:
         return None
@@ -415,6 +431,58 @@ def predict_position(past_gaps, rpci_pred=None):
         'past_gaps':  valid_gaps,
     }
 
+
+# ============================================================
+# 前半ペース速度（追走能力）の評価
+# PCIから前半1F平均を逆算: Ave3F = (PCI+50) × 上がり / 100
+# 前半1F = Ave3F / 3
+# 距離別基準（良馬場・2020〜2026年重賞実測値）
+# ============================================================
+FRONT_PACE_BASE = {
+    # 距離: (1F平均基準秒, std)
+    1000: (11.244, 0.219),
+    1200: (11.462, 0.253),
+    1400: (11.674, 0.269),
+    1500: (12.123, 0.160),
+    1600: (11.840, 0.220),
+    1800: (12.045, 0.247),
+    2000: (12.117, 0.214),
+    2200: (12.131, 0.177),
+    2400: (12.248, 0.169),
+    2500: (12.323, 0.178),
+    3000: (12.400, 0.200),  # 推定値
+    3200: (12.420, 0.200),  # 推定値
+}
+
+def calc_front_pace_z(pci, agari, dist):
+    """
+    PCIと上がりから「前半ペースZスコア」を計算。
+    
+    前半1F平均 = (PCI+50) × 上がり / 100 / 3
+    前半ペースZ = (基準1F - 実際1F) / std
+      → マイナス = 前半が速い（追走がきつい）
+      → プラス   = 前半が遅い（スロー）
+    
+    Returns:
+        float or None: 前半ペースZスコア
+    """
+    try:
+        pci = float(pci); agari = float(agari); dist = int(dist)
+    except: return None
+    if math.isnan(pci) or math.isnan(agari): return None
+    
+    ave3f = (pci + 50) * agari / 100      # 前半3F換算タイム
+    front_1f = ave3f / 3                   # 前半1F平均
+    
+    # 距離別の基準値（最近傍距離を使用）
+    dists = sorted(FRONT_PACE_BASE.keys())
+    nearest = min(dists, key=lambda d: abs(d - dist))
+    base_1f, std_1f = FRONT_PACE_BASE[nearest]
+    std_1f = std_1f if std_1f > 0 else 0.2
+    
+    # Z = (基準 - 実際) / std  → マイナスが速い
+    return round((base_1f - front_1f) / std_1f, 3)
+
 WALK_DEFS = [
     {'n':1,'agari':'上り3F',  'rpci':'RPCI',  'venue':'場所',  'dist':'距離',
      'baba':'馬場状態',  'rank':'着順',  'race':'ﾚｰｽ名･1走前','td':'TD','gap':'-3F差'},
@@ -544,11 +612,27 @@ def build_base_table(file_bytes):
     稍重_dict  = {(r['距離_num'], r['競馬場']): (r['avg'], r['std']) for _, r in 稍_s.iterrows()}
     return base_dict, 稍重_dict
 
-def get_z(agari, dist, venue, baba, base_dict, 稍重_dict):
+def get_z(agari, dist, venue, baba, base_dict, 稍重_dict,
+          race_base=None, race_name=None):
+    """
+    Zスコア計算。race_base（同名レース重み付き基準）があれば優先使用。
+    """
     fb  = {1000:32.5,1200:34.0,1400:34.2,1600:34.4,
            1800:34.6,2000:35.0,2200:35.2,2400:35.3,2500:35.5}
     key = (float(dist), venue)
     b   = str(baba).strip()
+
+    # 同名レース重み付き基準（良馬場のみ）
+    if race_base and race_name and b == '良':
+        tname = re.sub(r'[ＨＧＳＬOP０-９G0-9HLS\s\u3000・]','',str(race_name))
+        rkey  = (float(dist), venue, tname)
+        if rkey in race_base:
+            base = race_base[rkey]
+            # stdは通常の基準テーブルから取得
+            _, std = base_dict.get(key, (base, 1.0))
+            std = std if (std and std > 0) else 1.0
+            return (base - agari) / std
+
     if b == '稍' and key in 稍重_dict:
         base, std = 稍重_dict[key]
     elif key in base_dict:
@@ -565,7 +649,7 @@ def get_z(agari, dist, venue, baba, base_dict, 稍重_dict):
 # ============================================================
 def calc_lpi(entry_bytes, base_dict, 稍重_dict,
              target_track='T', target_venue='東京', bonus_strength=0.15,
-             pace_pred_rpci=51.0):
+             pace_pred_rpci=51.0, race_base_dict=None, target_race_name=''):
     for enc in ['cp932', 'shift_jis', 'utf-8-sig', 'utf-8']:
         try:
             df = pd.read_csv(io.BytesIO(entry_bytes), encoding=enc)
@@ -610,6 +694,8 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
                 track = td if td in ('T','D') else 'T'
                 gap_raw = row.get(wd['gap'], None)
                 gap   = float(gap_raw) if str(gap_raw).strip() not in ['nan','NaN','','None','----'] else None
+                pci_raw = row.get(wd.get('pci',''), None)
+                pci_val = float(str(pci_raw).strip()) if str(pci_raw).strip() not in ['nan','NaN','','None','----'] else None
             except:
                 continue
             if math.isnan(agari) or math.isnan(rpci): continue
@@ -618,7 +704,7 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
             grade    = extract_grade(race)
             wt_corr  = weight_correction_sec(grade, age, sex)
             agari_adj = agari + wt_corr
-            z        = get_z(agari_adj, dist, venue, baba, base_dict, 稍重_dict)
+            z        = get_z(agari_adj, dist, venue, baba, base_dict, 稍重_dict, race_base_dict, race)
             pb       = calc_pb_v11(rpci, gap_est, z)
             pm       = 1.0 + abs(rpci - 50) / 25 * 0.4
             rank_int = to_int_rank(rank)
@@ -648,15 +734,19 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
             lpi  = sigmoid_score((z + pb + hb) * pm * g1_pen)
             gw   = GRADE_WEIGHT.get(grade, GRADE_WEIGHT[''])
 
+            # 前半ペースZスコア（PCIから逆算）
+            fp_z = calc_front_pace_z(pci_val, agari, dist) if pci_val is not None else None
+
             run_data.append({
                 'n': wd['n'], 'race': race, 'dist': dist, 'venue': venue,
-                'rpci': rpci, 'gap_est': round(gap_est, 2),
+                'rpci': rpci, 'pci': pci_val, 'gap_est': round(gap_est, 2),
                 'agari': agari, 'agari_adj': round(agari_adj, 2),
                 'wt_corr': round(wt_corr, 2),
                 'z': round(z, 3), 'rank': rank, 'rank_int': rank_int,
                 'baba': baba, 'track': track, 'grade': grade,
                 'pb': pb, 'pm': round(pm, 3), 'hb': hb, 'hb_r': hb_r,
                 'elem': elem, 'lpi': lpi, 'grade_weight': gw,
+                'front_pace_z': round(fp_z, 3) if fp_z is not None else None,
                 'excluded_baba':  baba not in GOOD_BABA,
                 'excluded_track': track != target_track,
             })
@@ -879,7 +969,7 @@ if run_btn or (base_file and entry_file):
         pace = get_pace_prediction(race_dist, target_venue, nige_count, senkou_count)
 
     with st.spinner('基準テーブルを構築中...'):
-        base_dict, 稍重_dict = build_base_table(base_file.read())
+        base_dict, 稍重_dict, race_base_dict = build_base_table(base_file.read())
         base_file.seek(0)  # 再読み込みのためリセット
 
     with st.spinner('LPI計算中...'):
@@ -890,6 +980,8 @@ if run_btn or (base_file and entry_file):
             target_venue=target_venue,
             bonus_strength=bonus_strength,
             pace_pred_rpci=pace['pred_rpci'],
+            race_base_dict=race_base_dict,
+            target_race_name=race_name,
         )
 
     if not results:
@@ -1115,6 +1207,7 @@ if run_btn or (base_file and entry_file):
                     'hb(不利B)':   rn['hb'],
                     'LPI':      rn['lpi'],
                     '要素型':   rn['elem'],
+                    '前半速度Z': rn.get('front_pace_z', '-'),
                     '除外':     '⚠️ ' + '/'.join(excl_reason) if excl_reason else '✅',
                     '不利理由': rn['hb_r'],
                 })
