@@ -75,6 +75,130 @@ VENUE_ELEMENT_COEF = {
 }
 
 
+
+# ============================================================
+# 上がり予測スコア
+# 過去走のZスコア（コース補正済み上がり）から予測
+# 検証結果: 相関r=0.27, A評価のZ平均=+0.38（C評価=-0.24）
+# 競馬場ごとの基準上がりは base_dict / 稍重_dict を使用
+# ============================================================
+
+# 競馬場×距離の基準上がり（上がり予測の補正に使用）
+# 対象コースで上がりが速くなる/遅くなる傾向を補正
+COURSE_AGARI_BASE = {
+    # (距離, 競馬場): 良馬場の基準上がり秒数
+    # 数値が小さいコース = 上がりが速いコース = 高い数値のZが出やすい
+    (1200,'東京'): 33.98, (1200,'中山'): 34.29, (1200,'阪神'): 34.06,
+    (1200,'中京'): 34.11, (1200,'京都'): 33.93, (1200,'新潟'): 33.85,
+    (1400,'東京'): 34.10, (1400,'阪神'): 34.27, (1400,'中京'): 34.22,
+    (1600,'東京'): 34.38, (1600,'中山'): 34.51, (1600,'阪神'): 34.46,
+    (1600,'京都'): 34.28, (1600,'中京'): 34.27, (1600,'新潟'): 34.41,
+    (1800,'東京'): 34.63, (1800,'中山'): 35.08, (1800,'阪神'): 34.85,
+    (2000,'東京'): 34.35, (2000,'中山'): 35.36, (2000,'阪神'): 35.55,
+    (2000,'京都'): 34.86, (2000,'中京'): 34.97,
+    (2200,'京都'): 34.83, (2200,'阪神'): 35.25,
+    (2400,'東京'): 35.22, (2400,'京都'): 34.91,
+    (2500,'中山'): 35.74,
+}
+
+def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
+                  base_dict_arg=None, 稍重_dict_arg=None):
+    """
+    過去走のZスコア（コース補正済み上がり）から上がり能力を予測。
+
+    Args:
+        past_runs: 過去走データのリスト（新しい順）。各要素はrun_dataのdict。
+        target_dist: 今回のレース距離
+        target_venue: 今回の競馬場
+        target_baba: 今回の馬場状態
+
+    Returns:
+        dict: {
+          'pred_z':      予測Zスコア,
+          'grade':       'A'/'B'/'C',
+          'grade_label': '🔴切れ味A'等,
+          'pred_agari':  予測上がり秒数（今回コースの基準に変換）,
+          'confidence':  '◎安定/○やや安定/△不安定',
+          'comment':     コメント,
+          'n_valid':     有効走数,
+        }
+    """
+    # 有効走のZスコアを取得（良+稍重のみ）
+    valid_zs = []
+    for r in past_runs:
+        if r.get('excluded_baba') or r.get('excluded_track'):
+            continue
+        z = r.get('z')
+        if z is not None and not math.isnan(float(z)):
+            valid_zs.append(float(z))
+        if len(valid_zs) >= 5:
+            break
+
+    if not valid_zs:
+        return None
+
+    # 直近重み付き平均（1走前45%・2走前30%・3走前15%・4走前7%・5走前3%）
+    weights = [0.45, 0.30, 0.15, 0.07, 0.03]
+    total_w, weighted_sum = 0.0, 0.0
+    for i, z in enumerate(valid_zs):
+        w = weights[i] if i < len(weights) else 0.03
+        weighted_sum += z * w
+        total_w += w
+    pred_z = round(weighted_sum / total_w, 3) if total_w > 0 else valid_zs[0]
+
+    # 安定度（std）
+    z_std = float(np.std(valid_zs, ddof=1)) if len(valid_zs) >= 2 else 0.8
+    if z_std <= 0.4:   confidence = '◎安定'
+    elif z_std <= 0.7: confidence = '○やや安定'
+    else:              confidence = '△不安定'
+
+    # 評価グレード（A/B/C）
+    # A: Zスコア > 0.40（上位33%）
+    # B: -0.13〜0.40（中間34%）
+    # C: < -0.13（下位33%）
+    if pred_z > 0.40:
+        grade = 'A'
+        grade_label = '🔴 切れ味A'
+        comment = f'上がり上位33%水準（予測Z={pred_z:+.2f}）。末脚が武器。'
+    elif pred_z >= -0.13:
+        grade = 'B'
+        grade_label = '🟡 切れ味B'
+        comment = f'上がり標準水準（予測Z={pred_z:+.2f}）。平均的な末脚。'
+    else:
+        grade = 'C'
+        grade_label = '⚪ 切れ味C'
+        comment = f'上がり下位33%水準（予測Z={pred_z:+.2f}）。末脚より先行力で勝負。'
+
+    # 予測上がり秒数（今回のコースの基準値から逆算）
+    key = (float(target_dist), target_venue)
+    course_base = COURSE_AGARI_BASE.get(key, 34.5)
+    # 稍重補正（稍重は約0.4秒遅い）
+    if str(target_baba).strip() == '稍':
+        course_base += 0.4
+    # pred_z = (base - agari) / std → agari = base - pred_z * std
+    # stdは1.0で近似（課題コースのstdが不明な場合）
+    course_std = 1.0
+    pred_agari = round(course_base - pred_z * course_std, 1)
+
+    # コース補正コメント追加
+    fast_courses = [(key, v) for key, v in COURSE_AGARI_BASE.items()
+                    if key[0] == float(target_dist) and v < course_base - 0.3]
+    slow_courses = [(key, v) for key, v in COURSE_AGARI_BASE.items()
+                    if key[0] == float(target_dist) and v > course_base + 0.3]
+
+    return {
+        'pred_z':       pred_z,
+        'grade':        grade,
+        'grade_label':  grade_label,
+        'pred_agari':   pred_agari,
+        'course_base':  course_base,
+        'confidence':   confidence,
+        'z_std':        round(z_std, 3),
+        'comment':      comment,
+        'n_valid':      len(valid_zs),
+        'past_zs':      [round(z, 2) for z in valid_zs],
+    }
+
 # ============================================================
 # ペース予測テーブル（コース×距離の統計的RPCI傾向）
 # ============================================================
@@ -500,6 +624,14 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
                                if r['gap_est'] < 5.0][:5]  # 大外れ値除外
         pos_pred = predict_position(past_gaps_for_pred, pace['pred_rpci'])
 
+        # 上がり予測（過去走のZスコアから）
+        agari_pred = predict_agari(
+            past_runs    = use[:5],
+            target_dist  = float(str(run_data[0]['dist']).replace('m','')),
+            target_venue = target_venue,
+            target_baba  = '良',
+        )
+
         results.append({
             'horse': horse, 'sex': sex, 'age': age,
             'avg_lpi': avg_lpi, 'avg_venue_lpi': avg_venue,
@@ -508,7 +640,8 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
             'n_valid': len(valid), 'n_total': len(run_data), 'n_good': len(good),
             'dom_elem': dom_elem, 'coef': round(coef, 2),
             'venue_delta': round(avg_venue - avg_lpi, 1),
-            'pos_pred': pos_pred,
+            'pos_pred':   pos_pred,
+            'agari_pred': agari_pred,
             'runs': run_data, 'valid_runs': valid, 'good_runs': good,
         })
 
@@ -720,6 +853,11 @@ if run_btn or (base_file and entry_file):
                 '平均-3F差':       (f"{sum(r['pos_pred']['past_gaps'])/len(r['pos_pred']['past_gaps']):.1f}秒"
                                     f"(n={r['pos_pred']['n_valid']})")
                                    if r.get('pos_pred') and r['pos_pred']['past_gaps'] else '-',
+                '上がり予測':      (r['agari_pred']['grade_label']
+                                    + ' ' + r['agari_pred']['confidence'])
+                                   if r.get('agari_pred') else '-',
+                '予測上がり秒':    r['agari_pred']['pred_agari']
+                                   if r.get('agari_pred') else '-',
                 '不利ボーナス':   bonus_str,
             })
 
@@ -793,6 +931,13 @@ if run_btn or (base_file and entry_file):
                     f"**予測ポジション:** {pp['icon']} {pp['label']}　"
                     f"予測地点差 **{pp['pred_gap']:.2f}秒**　"
                     f"安定度: **{pp['confidence']}**（過去{pp['n_valid']}走 std={pp['gap_std']:.3f}）",
+                )
+            if hr.get('agari_pred'):
+                ap = hr['agari_pred']
+                st.markdown(
+                    f"**上がり予測:** {ap['grade_label']}　{ap['confidence']}　"
+                    f"予測上がり **{ap['pred_agari']}秒**（コース基準{ap['course_base']:.1f}秒）　"
+                    f"過去走Z: {ap['past_zs']}",
                 )
             col1.metric('LPI補正', f"{hr['avg_venue_lpi']:.1f}")
             col2.metric('LPI基本', f"{hr['avg_lpi']:.1f}")
