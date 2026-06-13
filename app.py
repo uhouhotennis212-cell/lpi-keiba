@@ -822,25 +822,26 @@ with st.sidebar:
                                    help='出走表の決め手=先行の馬の頭数')
 
     st.markdown('**ペース直接指定（任意）**')
-    use_manual_rpci = st.checkbox(
-        'RPCIを直接入力する',
-        value=False,
-        help='逃げ馬1頭でもハイになりそうな場合など、自動推定より自分の読みを優先したいときに使用'
+    st.markdown('**ペース直接指定（任意）**')
+    manual_pace = st.radio(
+        'ペース帯を選択',
+        options=['自動推定（コース統計から）', '🔵 H（ハイ）', '🟢 M（ミドル）', '🟠 S（スロー）'],
+        index=0,
+        help='自動推定: コース統計+逃げ・先行頭数から計算\n'
+             'H: 前半が速く先行馬が消耗する展開\n'
+             'M: 平均的なペース\n'
+             'S: 前半が遅く上がり勝負になる展開',
+        horizontal=False,
     )
-    if use_manual_rpci:
-        manual_rpci = st.number_input(
-            'RPCI値を入力',
-            min_value=30.0, max_value=75.0, value=50.0, step=0.5,
-            help='40台=ハイ / 50前後=ミドル / 55以上=スロー'
-        )
-        pace_zone_label = (
-            '🔵 ハイペース（RPCI≤47）' if manual_rpci <= 47 else
-            '🟠 スローペース（RPCI≥54）' if manual_rpci >= 54 else
-            '🟢 ミドルペース（RPCI 48〜53）'
-        )
-        st.caption(f'→ {pace_zone_label}')
-    else:
+    # radio の選択を pace_cat と manual_rpci に変換
+    if '自動' in manual_pace:
         manual_rpci = 0.0
+    elif 'H' in manual_pace:
+        manual_rpci = 45.0   # H帯の代表値
+    elif 'M' in manual_pace:
+        manual_rpci = 51.0   # M帯の代表値
+    else:  # S
+        manual_rpci = 57.0   # S帯の代表値
 
     run_btn = st.button('🔍 LPI計算実行', type='primary', use_container_width=True)
 
