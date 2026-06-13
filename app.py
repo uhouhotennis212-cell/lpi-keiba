@@ -565,7 +565,8 @@ def get_z(agari, dist, venue, baba, base_dict, 稍重_dict):
 # LPI計算メイン
 # ============================================================
 def calc_lpi(entry_bytes, base_dict, 稍重_dict,
-             target_track='T', target_venue='東京', bonus_strength=0.15):
+             target_track='T', target_venue='東京', bonus_strength=0.15,
+             pace_pred_rpci=51.0):
     for enc in ['cp932', 'shift_jis', 'utf-8-sig', 'utf-8']:
         try:
             df = pd.read_csv(io.BytesIO(entry_bytes), encoding=enc)
@@ -684,11 +685,11 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
         # ポジション予測（有効走の地点差から）
         past_gaps_for_pred = [r['gap_est'] for r in use
                                if r['gap_est'] < 5.0][:5]  # 大外れ値除外
-        pos_pred = predict_position(past_gaps_for_pred, pace['pred_rpci'])
+        pos_pred = predict_position(past_gaps_for_pred, pace_pred_rpci)
 
         # 上がり予測（過去走のZスコアから）
         # コースのペース予測からペース帯を決定
-        _pred_rpci = pace['pred_rpci']
+        _pred_rpci = pace_pred_rpci
         _pace_cat  = 'H' if _pred_rpci <= 47 else ('S' if _pred_rpci >= 54 else 'M')
 
         # 予測ポジション（地点差）を上がり予測に渡す
@@ -855,8 +856,28 @@ if not entry_file:
     st.stop()
 
 if run_btn or (base_file and entry_file):
-    # ペース予測（LPI計算内の pos_pred からも参照するため先に実行）
-    pace = get_pace_prediction(race_dist, target_venue, nige_count, senkou_count)
+    # ペース予測（manual_rpci が入力されていればそちらを優先）
+    if manual_rpci > 0:
+        _mr = manual_rpci
+        if _mr <= 47:
+            _label, _lamp = 'ハイペース（直接指定）', '🔵'
+            _elem_adv = ['基礎スピード・パワー', 'パワー・ロンスパ']
+            _comment  = 'H（ハイ）指定 — 前半速く先行馬が消耗。基礎スピード型・差し馬有利'
+        elif _mr >= 54:
+            _label, _lamp = 'スローペース（直接指定）', '🟠'
+            _elem_adv = ['ギアチェンジ', 'ロンスパ・ギアチェンジ']
+            _comment  = 'S（スロー）指定 — 上がり勝負。GC型有利、先行馬の前残りも警戒'
+        else:
+            _label, _lamp = 'ミドルペース（直接指定）', '🟢'
+            _elem_adv = []
+            _comment  = 'M（ミドル）指定 — 平均的なペース。どちらも起こりうる'
+        pace = dict(pred_rpci=_mr, base_rpci=_mr, std=0.0,
+                    slow_pct=100 if _mr>=54 else 0,
+                    fast_pct=100 if _mr<=47 else 0,
+                    label=_label, lamp=_lamp,
+                    elem_adv=_elem_adv, comment=_comment)
+    else:
+        pace = get_pace_prediction(race_dist, target_venue, nige_count, senkou_count)
 
     with st.spinner('基準テーブルを構築中...'):
         base_dict, 稍重_dict = build_base_table(base_file.read())
@@ -869,6 +890,7 @@ if run_btn or (base_file and entry_file):
             target_track=track_code,
             target_venue=target_venue,
             bonus_strength=bonus_strength,
+            pace_pred_rpci=pace['pred_rpci'],
         )
 
     if not results:
