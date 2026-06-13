@@ -922,7 +922,7 @@ if run_btn or (base_file and entry_file):
 
 
     # ---- タブで表示 ----
-    tab1, tab2, tab3 = st.tabs(['📊 ランキング表', '📈 グラフ', '🔍 過去走詳細'])
+    tab1, tab2, tab3, tab4 = st.tabs(['📊 ランキング表', '📈 グラフ', '🔍 過去走詳細', '🎲 シミュレーション'])
 
     # ===== タブ1: ランキング表 =====
     with tab1:
@@ -1135,6 +1135,113 @@ if run_btn or (base_file and entry_file):
                              '斤量補正': '{:+.2f}'}),
                 use_container_width=True,
             )
+
+    # ===== タブ4: モンテカルロシミュレーション =====
+    with tab4:
+        st.subheader('🎲 モンテカルロ シミュレーション')
+        st.markdown(
+            '予測上がり・予測地点差の**誤差範囲でランダムにばらつかせて**1万回レースを試行し、'
+            '各馬の勝利確率・複勝確率を推定します。'
+        )
+
+        # シミュレーション対象馬（pos_pred・agari_pred が揃っている馬）
+        sim_horses = [(r['horse'],
+                       r['pos_pred']['pred_gap'],
+                       r['agari_pred']['pred_agari'])
+                      for r in results
+                      if r.get('pos_pred') and r.get('agari_pred')]
+
+        if len(sim_horses) < 2:
+            st.warning('予測ポジション・上がり予測が計算できた馬が2頭未満のため実行できません。')
+        else:
+            col_s1, col_s2 = st.columns(2)
+            with col_s1:
+                n_trials = st.select_slider(
+                    '試行回数',
+                    options=[1000, 3000, 5000, 10000],
+                    value=5000,
+                    help='多いほど精度が上がるが時間がかかります'
+                )
+            with col_s2:
+                show_top3 = st.checkbox('複勝確率（3着以内）も表示', value=True)
+
+            if st.button('▶️ シミュレーション実行', type='primary'):
+                # 誤差パラメータ（16,691走の実測値）
+                AGARI_ERR_STD = 1.065  # 上がり予測誤差のstd（秒）
+                GAP_ERR_STD   = 0.589  # 地点差予測誤差のstd（秒）
+
+                names      = [h[0] for h in sim_horses]
+                pred_gaps  = np.array([h[1] for h in sim_horses])
+                pred_agari = np.array([h[2] for h in sim_horses])
+                pred_total = pred_gaps + pred_agari
+                n_horses   = len(names)
+
+                wins  = np.zeros(n_horses)
+                top3s = np.zeros(n_horses)
+
+                np.random.seed(None)
+                with st.spinner(f'{n_trials:,}回シミュレーション中...'):
+                    for _ in range(n_trials):
+                        sim_gaps   = pred_gaps  + np.random.normal(0, GAP_ERR_STD,   n_horses)
+                        sim_agaris = pred_agari + np.random.normal(0, AGARI_ERR_STD, n_horses)
+                        sim_gaps   = np.maximum(0, sim_gaps)
+                        sim_totals = sim_gaps + sim_agaris
+                        order      = np.argsort(sim_totals)
+                        wins[order[0]]   += 1
+                        top3s[order[:3]] += 1
+
+                # 結果DataFrame
+                sim_rows = []
+                for i in range(n_horses):
+                    wp = wins[i]  / n_trials * 100
+                    pp = top3s[i] / n_trials * 100
+                    lpi_rank = next((j+1 for j,r in enumerate(results) if r['horse']==names[i]), '-')
+                    sim_rows.append({
+                        '勝利確率順':  i+1,
+                        '馬名':        names[i],
+                        'LPI順位':     lpi_rank,
+                        '予測通過T':   f'{pred_total[i]:.2f}秒',
+                        '勝利確率':    f'{wp:.1f}%',
+                        '複勝確率':    f'{pp:.1f}%',
+                        '勝利回数':    int(wins[i]),
+                    })
+
+                sim_df = pd.DataFrame(sim_rows)
+                # 勝利確率順にソート
+                sim_df = sim_df.sort_values('勝利回数', ascending=False).reset_index(drop=True)
+                sim_df['勝利確率順'] = range(1, len(sim_df)+1)
+
+                # ハイライト
+                def sim_highlight(row):
+                    rank = row['勝利確率順']
+                    if rank == 1: return ['background-color:#F9A825;color:#000;font-weight:bold']*len(row)
+                    if rank == 2: return ['background-color:#1565C0;color:#fff;font-weight:bold']*len(row)
+                    if rank == 3: return ['background-color:#BF360C;color:#fff;font-weight:bold']*len(row)
+                    return ['']*len(row)
+
+                display_cols = ['勝利確率順','馬名','LPI順位','予測通過T','勝利確率']
+                if show_top3:
+                    display_cols.append('複勝確率')
+
+                st.dataframe(
+                    sim_df[display_cols].style
+                        .apply(sim_highlight, axis=1)
+                        .hide(axis='index'),
+                    use_container_width=True,
+                    height=min(600, 45 + len(sim_df)*38),
+                )
+
+                # 補足
+                st.caption(
+                    f'試行回数: {n_trials:,}回 ／ '
+                    f'上がり誤差±{AGARI_ERR_STD:.2f}秒（1σ）／ '
+                    f'地点差誤差±{GAP_ERR_STD:.2f}秒（1σ）'
+                )
+                st.info(
+                    '💡 勝利確率はLPI順位と異なる場合があります。'
+                    '予測通過Tが近い馬は誤差の影響を受けやすく、確率が均等に近くなります。'
+                    'LPI上位でも通過Tが遅い馬は勝利確率が低く出ます。'
+                )
 
 # ============================================================
 # フッター
