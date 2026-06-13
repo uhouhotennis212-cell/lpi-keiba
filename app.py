@@ -266,20 +266,21 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
     }
 
 
+POS_ZONE_LABELS = {
+    1: ('逃げ',  '平均0.1以下',  '#1A237E', '🟦'),
+    2: ('先行',  '0.2〜0.4秒',   '#1B5E20', '🟩'),
+    3: ('中団',  '0.5〜1.0秒',   '#E65100', '🟨'),
+    4: ('後方',  '1.1秒〜',      '#B71C1C', '🟥'),
+}
+
 def gap_to_zone(gap):
-    """
-    地点差(秒) → ポジション帯番号
-    1=逃げ（平均0.1以下）
-    2=先行（0.2〜0.4）
-    3=中団（0.5〜1.0）
-    4=後方（1.1〜）
-    """
+    """地点差(秒) → ポジション帯番号"""
     if gap is None or (isinstance(gap, float) and math.isnan(gap)):
         return None
-    if gap <= 0.1: return 1   # 逃げ：先頭からほぼ0
-    if gap <= 0.4: return 2   # 先行：0.2〜0.4秒
-    if gap <= 1.0: return 3   # 中団：0.5〜1.0秒
-    return 4                   # 後方：1.1秒〜
+    if gap <= 0.1: return 1
+    if gap <= 0.4: return 2
+    if gap <= 1.0: return 3
+    return 4
 
 def predict_position(past_gaps, rpci_pred=None):
     """
