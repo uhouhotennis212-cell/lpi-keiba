@@ -166,44 +166,18 @@ COURSE_AGARI_BASE = {
 def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
                   predicted_pace_cat=None, pred_gap=None):
     """
-    上がり予測 v2：ペース帯別Zスコアを別管理して精度向上。
+    上がり予測 v3：全走平均Z + 先行×H消耗補正
 
-    過去走を H/M/S のペース帯に分類し、
-    コース予測ペースに対応するZ平均を返す。
-    精度: 相関 r=0.76（ペース帯揃え時）
-
-    Args:
-        past_runs:          過去走データのリスト（新しい順, run_dataのdict）
-        target_dist:        今回の距離
-        target_venue:       今回の競馬場
-        target_baba:        今回の馬場
-        predicted_pace_cat: 予測ペース帯 'H'/'M'/'S'（PACE_TABLEから取得）
-
-    Returns:
-        dict: {
-          'pace_cat':       使用したペース帯,
-          'pred_z':         予測Zスコア,
-          'z_by_pace':      {'H':float,'M':float,'S':float} ペース帯別Z平均,
-          'n_by_pace':      {'H':int,'M':int,'S':int} ペース帯別走数,
-          'grade':          'A'/'B'/'C',
-          'grade_label':    '🔴切れ味A'等,
-          'pred_agari':     予測上がり秒数,
-          'confidence':     '◎安定/○やや安定/△不安定',
-          'comment':        コメント文,
-          'n_valid':        有効走総数,
-        }
+    設計方針:
+    1. ペース帯別分類をやめて全走の加重平均Zを使う
+       （H/M/S分類の精度向上効果がr=0.284と同じことが判明）
+    2. 先行（地点差≤0.4）×H走（RPCI≤47）は消耗走として重み×0.3
+       （能力ではなく展開の犠牲なので過小評価を防ぐ）
+    3. 予測ポジション（pred_gap）で位置取り補正（既存維持）
     """
-    # ペース帯別グレード境界（2020〜2026年全重賞 16,691走から算出）
-    PACE_GRADE_THRESH = {
-        'H': {'A': -0.006, 'C': -0.988},
-        'M': {'A':  0.399, 'C': -0.340},
-        'S': {'A':  0.769, 'C':  0.179},
-        None:{'A':  0.458, 'C': -0.341},
-    }
+    GRADE_THRESH = {'A': 0.458, 'C': -0.341}
 
-    # 有効走をペース帯別に分類
-    z_by_pace  = {'H': [], 'M': [], 'S': []}
-    all_z_list = []
+    weighted_zs = []
 
     for r in past_runs:
         if r.get('excluded_baba') or r.get('excluded_track'):
@@ -212,140 +186,85 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
         if z is None or math.isnan(float(z)):
             continue
         z = float(z)
-        rpci = r.get('rpci')
-        if rpci is not None and not math.isnan(float(rpci)):
-            rpci = float(rpci)
-            if rpci <= 47:   pace = 'H'
-            elif rpci >= 54: pace = 'S'
-            else:            pace = 'M'
-        else:
-            pace = 'M'  # 不明はミドル扱い
 
-        # 前半ペースZスコア: マイナスほど速い前半
+        rpci    = r.get('rpci', 50)
+        gap_est = r.get('gap_est', 0.7)
+
+        # 先行×H走の消耗補正: 重みを0.3に下げる
+        is_senkou_H = (float(gap_est) <= 0.4 and float(rpci) <= 47)
+        weight = 0.3 if is_senkou_H else 1.0
+
+        # 追走能力ボーナス（速い前半×速い上がり）
         fp_z = r.get('front_pace_z')
-        # 「前半が速いレース（fp_z<-0.3）でもZが高い馬」= 追走能力が高い
-        # ボーナス: 速い前半（fp_z<-0.3）でZ>+0.3 → 追走能力加算
         chase_bonus = 0.0
         if fp_z is not None and not math.isnan(float(fp_z)):
             fp_z_f = float(fp_z)
             if fp_z_f < -0.3 and z > 0.3:
-                # 速い前半×速い上がり → 追走能力ボーナス
-                # 係数: fp_zが速いほど・zが高いほど大きい
                 chase_bonus = round(min(abs(fp_z_f) * z * 0.15, 0.4), 3)
-            elif fp_z_f > 0.3 and z > 0.5:
-                # 遅い前半×速い上がり → わずかにペナルティ（スロー展開の恩恵）
-                chase_bonus = round(-min(fp_z_f * 0.05, 0.1), 3)
 
-        z_by_pace[pace].append(z + chase_bonus)
-        all_z_list.append(z + chase_bonus)
+        weighted_zs.append((z + chase_bonus, weight))
 
-    if not all_z_list:
+    if not weighted_zs:
         return None
 
-    # ペース帯別の平均Z
-    # ※データ検証済み: 単純平均が r=0.284 で直近重み付け(r=0.258)より精度が高い
-    # 理由: 上がり能力は「直近の調子」より「その馬の素の能力」が支配的で
-    #       1走前と2走前の相関係数がほぼ同じ(r=0.177 vs 0.177)
-    def weighted_avg(zlist):
-        if not zlist: return None
-        # 単純平均（5走すべて均等）
-        return round(sum(zlist[:5]) / len(zlist[:5]), 3)
+    # 加重平均Z（消耗走は重み0.3）
+    total_w = sum(w for _, w in weighted_zs)
+    pred_z  = sum(z * w for z, w in weighted_zs) / total_w if total_w > 0 else 0.0
+    pred_z  = round(pred_z, 3)
+    all_z_list = [z for z, _ in weighted_zs]
 
-    z_avg = {pace: weighted_avg(zs) for pace, zs in z_by_pace.items()}
-    n_by_pace = {pace: len(zs) for pace, zs in z_by_pace.items()}
-
-    # 予測ペース帯に対応するZを選択
-    # 優先順位: 予測ペース帯 → 隣接ペース帯 → 全体平均
-    def pick_z(pred_pace):
-        if pred_pace and z_avg.get(pred_pace) is not None:
-            return pred_pace, z_avg[pred_pace]
-        # フォールバック: 隣接ペース帯
-        fallback_order = {
-            'H': ['H','M','S'],
-            'S': ['S','M','H'],
-            'M': ['M','H','S'],
-            None:['M','H','S'],
-        }
-        for p in fallback_order.get(pred_pace, ['M','H','S']):
-            if z_avg.get(p) is not None:
-                return p, z_avg[p]
-        # 全体加重平均
-        return None, weighted_avg(all_z_list)
-
-    used_pace, pred_z = pick_z(predicted_pace_cat)
-    if pred_z is None:
-        pred_z = weighted_avg(all_z_list)
-        used_pace = None
-
-    # 安定度（全走のstd）
+    # 安定度
     z_std = float(np.std(all_z_list, ddof=1)) if len(all_z_list) >= 2 else 0.8
     if z_std <= 0.4:   confidence = '◎安定'
     elif z_std <= 0.7: confidence = '○やや安定'
     else:              confidence = '△不安定'
 
-    # ペース帯に応じたグレード判定
-    thresh = PACE_GRADE_THRESH.get(used_pace, PACE_GRADE_THRESH[None])
-    if pred_z >= thresh['A']:
+    # グレード判定（全体基準）
+    if pred_z >= GRADE_THRESH['A']:
         grade, grade_label = 'A', '🔴 切れ味A'
-    elif pred_z < thresh['C']:
+    elif pred_z < GRADE_THRESH['C']:
         grade, grade_label = 'C', '⚪ 切れ味C'
     else:
         grade, grade_label = 'B', '🟡 切れ味B'
 
-    # フォールバック説明
-    pace_label = {'H':'ハイペース','M':'ミドル','S':'スロー',None:'全体平均'}
-    used_label = pace_label.get(used_pace, '全体平均')
-    fallback_note = ''
-    if used_pace != predicted_pace_cat and predicted_pace_cat is not None:
-        predicted_label = pace_label.get(predicted_pace_cat,'')
-        fallback_note = f'（{predicted_label}走データなし→{used_label}で代替）'
-
-    # コメント生成
-    n_used = n_by_pace.get(used_pace, len(all_z_list))
-    comment = (f'{used_label}時Z={pred_z:+.2f} {fallback_note}。'
+    n_discounted = sum(1 for _, w in weighted_zs if w < 1.0)
+    comment = (f'全走Z平均={pred_z:+.2f}。'
                f'{"上位33%の切れ味" if grade=="A" else "下位33%の末脚" if grade=="C" else "標準的な末脚"}。')
-    if grade == 'A' and used_pace == 'S' and predicted_pace_cat == 'S':
-        comment += 'スロー展開での切れ味は特に信頼できる。'
-    elif grade == 'C' and used_pace == 'H' and predicted_pace_cat == 'H':
-        comment += 'ハイペース時に上がりが鈍る傾向。先行有利な展開でのみ買える。'
+    if n_discounted > 0:
+        comment += f' 先行×H消耗走{n_discounted}件は重み0.3で補正済み。'
 
-    # 予測上がり秒数（予測ポジション補正込み）
+    # 予測上がり秒数（コース基準 − Z + 位置取り補正）
     course_base = COURSE_AGARI_BASE.get((float(target_dist), target_venue), 34.5)
-    if str(target_baba).strip() == '稍': course_base += 0.4
+    if str(target_baba).strip() == '稍':
+        course_base += 0.4
     GAP_CORRECTION = 0.383
-    BASE_GAP = 0.7
+    BASE_GAP       = 0.7
     if pred_gap is not None:
-        gap_adj = GAP_CORRECTION * (pred_gap - BASE_GAP)
+        gap_adj    = GAP_CORRECTION * (pred_gap - BASE_GAP)
         pred_agari = round(course_base - pred_z + gap_adj, 1)
-        gap_note = f'（位置取り補正: 地点差{pred_gap:.1f}秒 {gap_adj:+.2f}秒）'
+        gap_note   = f'（位置取り補正: 地点差{pred_gap:.1f}秒 {gap_adj:+.2f}秒）'
     else:
         pred_agari = round(course_base - pred_z, 1)
-        gap_note = '（位置取り不明: 地点差0.7秒想定）'
+        gap_note   = '（位置取り不明: 地点差0.7秒想定）'
 
     return {
-        'pace_cat':      used_pace,
-        'pred_z':        round(pred_z, 3),
-        'z_by_pace':     {p: round(v, 3) if v is not None else None for p,v in z_avg.items()},
-        'n_by_pace':     n_by_pace,
-        'grade':         grade,
-        'grade_label':   grade_label,
-        'pred_agari':    pred_agari,
-        'gap_note':      gap_note,
-        'course_base':   course_base,
-        'confidence':    confidence,
-        'z_std':         round(z_std, 3),
-        'comment':       comment,
-        'n_valid':       len(all_z_list),
-        'past_zs':       [round(z,2) for z in all_z_list[:5]],
+        'pace_cat':     None,
+        'pred_z':       pred_z,
+        'z_by_pace':    {'H': None, 'M': None, 'S': None},
+        'n_by_pace':    {'H': 0, 'M': 0, 'S': 0},
+        'grade':        grade,
+        'grade_label':  grade_label,
+        'pred_agari':   pred_agari,
+        'gap_note':     gap_note,
+        'course_base':  course_base,
+        'confidence':   confidence,
+        'z_std':        round(z_std, 3),
+        'comment':      comment,
+        'n_valid':      len(weighted_zs),
+        'n_discounted': n_discounted,
+        'past_zs':      [round(z, 2) for z, _ in weighted_zs],
     }
 
-
-POS_ZONE_LABELS = {
-    1: ('逃げ',  '平均0.1以下',  '#1A237E', '🟦'),
-    2: ('先行',  '0.2〜0.4秒',   '#1B5E20', '🟩'),
-    3: ('中団',  '0.5〜1.0秒',   '#E65100', '🟨'),
-    4: ('後方',  '1.1秒〜',      '#B71C1C', '🟥'),
-}
 
 def gap_to_zone(gap):
     """
