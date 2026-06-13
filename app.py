@@ -294,10 +294,18 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
     elif grade == 'C' and used_pace == 'H' and predicted_pace_cat == 'H':
         comment += 'ハイペース時に上がりが鈍る傾向。先行有利な展開でのみ買える。'
 
-    # 予測上がり秒数
+    # 予測上がり秒数（予測ポジション補正込み）
     course_base = COURSE_AGARI_BASE.get((float(target_dist), target_venue), 34.5)
     if str(target_baba).strip() == '稍': course_base += 0.4
-    pred_agari = round(course_base - pred_z * 1.0, 1)
+    GAP_CORRECTION = 0.383
+    BASE_GAP = 0.7
+    if pred_gap is not None:
+        gap_adj = GAP_CORRECTION * (pred_gap - BASE_GAP)
+        pred_agari = round(course_base - pred_z + gap_adj, 1)
+        gap_note = f'（位置取り補正: 地点差{pred_gap:.1f}秒 {gap_adj:+.2f}秒）'
+    else:
+        pred_agari = round(course_base - pred_z, 1)
+        gap_note = '（位置取り不明: 地点差0.7秒想定）'
 
     return {
         'pace_cat':      used_pace,
