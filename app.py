@@ -164,7 +164,7 @@ COURSE_AGARI_BASE = {
 }
 
 def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
-                  predicted_pace_cat=None):
+                  predicted_pace_cat=None, pred_gap=None):
     """
     上がり予測 v2：ペース帯別Zスコアを別管理して精度向上。
 
@@ -307,6 +307,7 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
         'grade':         grade,
         'grade_label':   grade_label,
         'pred_agari':    pred_agari,
+        'gap_note':      gap_note,
         'course_base':   course_base,
         'confidence':    confidence,
         'z_std':         round(z_std, 3),
@@ -682,12 +683,15 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
         _pred_rpci = pace['pred_rpci']
         _pace_cat  = 'H' if _pred_rpci <= 47 else ('S' if _pred_rpci >= 54 else 'M')
 
+        # 予測ポジション（地点差）を上がり予測に渡す
+        _pred_gap = pos_pred['pred_gap'] if pos_pred else None
         agari_pred = predict_agari(
             past_runs           = use[:5],
             target_dist         = float(str(run_data[0]['dist']).replace('m','')),
             target_venue        = target_venue,
             target_baba         = '良',
             predicted_pace_cat  = _pace_cat,
+            pred_gap            = _pred_gap,
         )
 
         results.append({
@@ -804,8 +808,25 @@ with st.sidebar:
 
     st.subheader('④ ペース予測（任意）')
     race_dist = st.number_input('レース距離（m）', min_value=1000, max_value=3600, value=1600, step=200)
-    nige_count   = st.number_input('逃げ馬頭数（出走表の決め手=逃げ）', min_value=0, max_value=10, value=0, step=1)
-    senkou_count = st.number_input('先行馬頭数（出走表の決め手=先行）', min_value=0, max_value=16, value=0, step=1)
+    nige_count   = st.number_input('逃げ馬頭数', min_value=0, max_value=10, value=0, step=1,
+                                   help='出走表の決め手=逃げの馬の頭数')
+    senkou_count = st.number_input('先行馬頭数', min_value=0, max_value=16, value=0, step=1,
+                                   help='出走表の決め手=先行の馬の頭数')
+
+    st.markdown('**ペース直接指定（任意）**')
+    manual_rpci = st.number_input(
+        'RPCI直接入力（空欄=コース統計から自動推定）',
+        min_value=30.0, max_value=75.0, value=0.0, step=0.5,
+        help='40台=ハイ / 50前後=ミドル / 55以上=スロー\n'
+             '0のままにするとコース統計と逃げ・先行頭数から自動推定します'
+    )
+    if manual_rpci > 0:
+        pace_zone_label = (
+            '🔵 ハイペース（RPCI≤47）' if manual_rpci <= 47 else
+            '🟠 スローペース（RPCI≥54）' if manual_rpci >= 54 else
+            '🟢 ミドルペース（RPCI 48〜53）'
+        )
+        st.caption(f'→ {pace_zone_label}')
 
     run_btn = st.button('🔍 LPI計算実行', type='primary', use_container_width=True)
 
@@ -1006,7 +1027,7 @@ if run_btn or (base_file and entry_file):
                 used_pace_lbl = {'H':'ハイペース','M':'ミドル','S':'スロー',None:'全体'}
                 st.markdown(
                     f"**上がり予測:** {ap['grade_label']}　{ap['confidence']}　"
-                    f"予測上がり **{ap['pred_agari']}秒**（コース基準{ap['course_base']:.1f}秒）\n\n"
+                    f"予測上がり **{ap['pred_agari']}秒**（コース基準{ap['course_base']:.1f}秒）{ap.get('gap_note','')}\n\n"
                     f"ペース帯別Z → {pace_z_str}\n\n"
                     f"{ap['comment']}",
                 )
