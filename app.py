@@ -145,6 +145,17 @@ def get_pace_prediction(dist, venue, nige_count=0, senkou_count=0):
 # 競馬場ごとの基準上がりは base_dict / 稍重_dict を使用
 # ============================================================
 
+# ============================================================
+# クッション値補正
+# 基準クッション値=9.0。これより低い（軟）ほど上がりが遅くなる
+# 補正式: (9.0 - cushion) × 0.15秒
+# ============================================================
+def calc_cushion_adj(cushion_val, base_cushion=9.0, coef=0.15):
+    """クッション値から基準上がりへの補正値を計算"""
+    if cushion_val is None:
+        return 0.0
+    return round((base_cushion - float(cushion_val)) * coef, 3)
+
 # 競馬場×距離の基準上がり（上がり予測の補正に使用）
 # 対象コースで上がりが速くなる/遅くなる傾向を補正
 COURSE_AGARI_BASE = {
@@ -164,7 +175,8 @@ COURSE_AGARI_BASE = {
 }
 
 def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
-                  predicted_pace_cat=None, pred_gap=None, pci_cs_score=None):
+                  predicted_pace_cat=None, pred_gap=None, pci_cs_score=None,
+                  cushion_correction=0.0):
     """
     上がり予測 v3：全走平均Z + 先行×H消耗補正
 
@@ -271,10 +283,13 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
     if pci_cs_coef < 1.0:
         comment += f' PCI追走スコア{pci_cs_score:.2f}→Z×{pci_cs_coef:.2f}で割引。'
 
-    # 予測上がり秒数（コース基準 − Z + 位置取り補正）
+    # 予測上がり秒数（コース基準 − Z + 位置取り補正 + クッション値補正）
     course_base = COURSE_AGARI_BASE.get((float(target_dist), target_venue), 34.5)
     if str(target_baba).strip() == '稍':
         course_base += 0.4
+    # クッション値補正を加算
+    if cushion_correction != 0.0:
+        course_base = round(course_base + cushion_correction, 3)
     GAP_CORRECTION = 0.383
     BASE_GAP       = 0.7
     if pred_gap is not None:
@@ -796,7 +811,7 @@ def get_z(agari, dist, venue, baba, base_dict, 稍重_dict,
 def calc_lpi(entry_bytes, base_dict, 稍重_dict,
              target_track='T', target_venue='東京', bonus_strength=0.15,
              pace_pred_rpci=51.0, race_base_dict=None, target_race_name='',
-             target_front_1f_input=None):
+             target_front_1f_input=None, cushion_correction_input=0.0):
     for enc in ['cp932', 'shift_jis', 'utf-8-sig', 'utf-8']:
         try:
             df = pd.read_csv(io.BytesIO(entry_bytes), encoding=enc)
@@ -951,6 +966,7 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
             predicted_pace_cat  = _pace_cat,
             pred_gap            = _pred_gap,
             pci_cs_score        = _pci_cs_score,
+            cushion_correction  = cushion_correction_input,
         )
 
         # ===== G1好走LPIボーナス（直近3走以内のG1好走に加算）=====
@@ -1135,6 +1151,32 @@ with st.sidebar:
     else:
         target_front_1f = None
 
+    st.subheader('⑥ クッション値（任意）')
+    use_cushion = st.checkbox(
+        'クッション値で基準上がりを補正する',
+        value=False,
+        help='当日朝に発表されるクッション値を入力すると\n'
+             '基準上がりが自動補正されます。\n'
+             '基準: 9.0（補正なし）\n'
+             '7.0（軟）→基準+0.30秒 / 11.0（硬）→基準-0.30秒'
+    )
+    if use_cushion:
+        cushion_val = st.number_input(
+            'クッション値',
+            min_value=5.0, max_value=14.0, value=9.0, step=0.1,
+            help='JRAが当日朝に発表。競馬場公式サイトで確認できます。'
+        )
+        cushion_adj = round((9.0 - cushion_val) * 0.15, 3)
+        if cushion_adj > 0:
+            st.caption(f'クッション値{cushion_val:.1f} → 基準上がり{cushion_adj:+.2f}秒（遅い馬場）')
+        elif cushion_adj < 0:
+            st.caption(f'クッション値{cushion_val:.1f} → 基準上がり{cushion_adj:+.2f}秒（速い馬場）')
+        else:
+            st.caption('クッション値9.0 → 補正なし（標準）')
+    else:
+        cushion_val  = 9.0
+        cushion_adj  = 0.0
+
     run_btn = st.button('🔍 LPI計算実行', type='primary', use_container_width=True)
 
 # ---- メインエリア ----
@@ -1185,6 +1227,7 @@ if run_btn or (base_file and entry_file):
             race_base_dict=race_base_dict,
             target_race_name=race_name,
             target_front_1f_input=target_front_1f if use_pci_cs else None,
+            cushion_correction_input=cushion_adj if use_cushion else 0.0,
         )
 
     if not results:
@@ -1203,13 +1246,18 @@ if run_btn or (base_file and entry_file):
     if pace['elem_adv']:
         adv_html = '  有利な要素型: **' + ' / '.join(pace['elem_adv']) + '**'
 
+    cushion_html = ''
+    if use_cushion and cushion_adj != 0.0:
+        c_label = '軟らかめ' if cushion_val < 8 else ('やや軟らかめ' if cushion_val < 9 else ('やや硬め' if cushion_val < 11 else '硬め'))
+        cushion_html = f'　🌿 クッション値{cushion_val:.1f}({c_label}) → 基準上がり{cushion_adj:+.2f}秒補正'
+
     st.markdown(
         f"""<div style="background:{bc};border:2px solid {brd};border-radius:8px;
         padding:12px 16px;margin:8px 0;font-size:13px;line-height:1.8;color:#FFFFFF;font-weight:500">
         <b>{pace['lamp']} ペース予測: {pace['label']}</b>　
         予測RPCI <b>{pace['pred_rpci']:.1f}</b>（基準{pace['base_rpci']:.1f}±{pace['std']:.1f}）<br>
         スロー率 <b>{pace['slow_pct']}%</b>　ハイ率 <b>{pace['fast_pct']}%</b><br>
-        {pace['comment']}{adv_html}
+        {pace['comment']}{adv_html}{cushion_html}
         </div>""",
         unsafe_allow_html=True
     )
