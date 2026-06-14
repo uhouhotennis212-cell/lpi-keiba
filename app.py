@@ -267,12 +267,11 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
         fp_z    = r.get('front_pace_z')
         pci     = r.get('pci')
 
-        # ペース調整済みZ: target_front_1f が設定かつPCI既知の走
+        # ペース調整済みZ: PCI既知の走は常にペース調整済みZを使う
+        # （PCI追走スコアON/OFFに関係なく、PCIデータがあれば適用）
         z_use = z  # デフォルトは固定基準Z
-        if (pci_cs_score is not None and
-                target_dist is not None and target_venue is not None and
+        if (target_dist is not None and target_venue is not None and
                 pci is not None and agari is not None):
-            # その走の前半1F
             try:
                 pci_f   = float(pci); agari_f = float(agari)
                 run_front_1f = (pci_f + 50) * agari_f / 100 / 3
@@ -284,7 +283,8 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
                 )
                 if pace_base is not None:
                     # stdは通常の基準テーブルから
-                    _, std_val = base_dict_for_z.get(
+                    _base_dict = base_dict_for_z or {}
+                    _, std_val = _base_dict.get(
                         (float(str(dist).replace('m','')), str(venue)), (pace_base, 1.0))
                     std_val = std_val if std_val and std_val > 0 else 1.0
                     z_use = (pace_base - agari_f) / std_val
@@ -296,9 +296,15 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
             fp_z_f = float(fp_z)
             if fp_z_f < -0.3 and z_use > 0.3:
                 chase_bonus = round(min(abs(fp_z_f) * z_use * 0.15, 0.4), 3)
+        # コース・距離の一致度による重み
+        course_w = calc_course_weight(
+            dist, venue, target_dist, target_venue
+        ) if (dist is not None and venue is not None) else 1.0
+
         all_runs_data.append({
             'z': z_use + chase_bonus, 'rpci': float(rpci),
             'gap_est': float(gap_est), 'grade': grade,
+            'course_w': course_w,
         })
 
     if not all_runs_data:
@@ -314,18 +320,23 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
     )
     source_runs = high_grade_runs if use_high_grade_only else all_runs_data
 
-    # weighted_zs を構築
+    # weighted_zs を構築（先行×H消耗補正 × コース距離重み）
     weighted_zs = []
     for r in source_runs:
-        # 先行×H走の消耗補正
         is_senkou_H = (r['gap_est'] <= 0.4 and r['rpci'] <= 47)
-        weight = 0.3 if is_senkou_H else 1.0
+        pace_w   = 0.3 if is_senkou_H else 1.0
+        course_w = r.get('course_w', 1.0)
+        weight   = round(pace_w * course_w, 3)
         weighted_zs.append((r['z'], weight))
 
     if not weighted_zs:
         # G1/G2走しか使わないモードで0件の場合は全走を使う
-        weighted_zs = [(r['z'], 0.3 if (r['gap_est']<=0.4 and r['rpci']<=47) else 1.0)
-                       for r in all_runs_data]
+        weighted_zs = [
+            (r['z'],
+             round((0.3 if (r['gap_est']<=0.4 and r['rpci']<=47) else 1.0)
+                   * r.get('course_w', 1.0), 3))
+            for r in all_runs_data
+        ]
 
     if not weighted_zs:
         return None
@@ -361,7 +372,7 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
     else:
         grade, grade_label = 'B', '🟡 切れ味B'
 
-    n_discounted = sum(1 for _, w in weighted_zs if w < 1.0)
+    n_discounted = sum(1 for _, w in weighted_zs if w < 0.9)
     grade_filter_note = ''
     if use_high_grade_only:
         grade_filter_note = f'（PCI-CS△以下のためG1/G2走{len(high_grade_runs)}件のみ使用）'
@@ -373,19 +384,30 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
         comment += f' PCI追走スコア{pci_cs_score:.2f}→Z×{pci_cs_coef:.2f}で割引。'
 
     # 予測上がり秒数（コース基準 − Z + 位置取り補正 + クッション値補正）
-    # PCI追走がONかつtarget_front_1fが設定されている場合はペース調整済み基準を使用
-    _target_front = None
-    if pci_cs_score is not None:
-        # target_front_1f は pci_cs_score の元情報から推定できないので
-        # PACE_REGRESSIONのキーとなる固定基準を使う
-        # （今回のペース基準はPCI-CS計算時のtarget_front_1fと同じ値）
-        # calc_lpi 側から pace_target_front_1f として渡す
-        pass
+    # ペース基準の優先順位:
+    #   1. pace_target_front_1f（サイドバー入力値）→ 最優先
+    #   2. predicted_pace_cat（H/M/S）からFRONT_PACE_BASEで推定
+    #   3. COURSE_AGARI_BASE の固定基準（フォールバック）
     if pace_target_front_1f is not None:
-        pace_adj_base = get_pace_adjusted_base(
-            float(target_dist), str(target_venue), pace_target_front_1f)
+        _front_for_base = pace_target_front_1f
+    elif predicted_pace_cat is not None:
+        # H/M/SペースからFRONT_PACE_BASEで代表前半1Fを推定
+        _dist_key = min(FRONT_PACE_BASE.keys(),
+                        key=lambda d: abs(d - float(target_dist)))
+        _base_front, _std_front = FRONT_PACE_BASE[_dist_key]
+        if predicted_pace_cat == 'H':
+            _front_for_base = _base_front - 0.24  # H = 基準より0.24秒速い（実測値）
+        elif predicted_pace_cat == 'S':
+            _front_for_base = _base_front + 0.21  # S = 基準より0.21秒遅い（実測値）
+        else:
+            _front_for_base = _base_front          # M = 基準値
     else:
-        pace_adj_base = None
+        _front_for_base = None
+
+    pace_adj_base = None
+    if _front_for_base is not None:
+        pace_adj_base = get_pace_adjusted_base(
+            float(target_dist), str(target_venue), _front_for_base)
 
     if pace_adj_base is not None:
         course_base = pace_adj_base
@@ -678,6 +700,37 @@ def calc_pci_cs(past_runs, target_front_1f, tolerance_good=0.15, tolerance_near=
         'n_fast':     n_fast,
         'detail':     detail,
     }
+
+
+def calc_course_weight(run_dist, run_venue, target_dist, target_venue):
+    """
+    過去走のコース・距離と今回の一致度から重みを計算。
+
+    設計根拠:
+    - 同コース・同距離が最も信頼性が高い（重み3.0）
+    - 距離差が大きいほど重みが下がる
+    - 他コースは同距離でも重み1.2（コース特性の差）
+    - 他コース・遠距離は重み0.3（参考程度）
+
+    例（対阪神2200m）:
+      阪神2200m → 3.0  阪神2000m → 1.5  東京2400m → 0.8
+      中山2200m → 1.2  東京2000m → 0.8  中山2500m → 0.5
+    """
+    try:
+        run_dist    = float(run_dist)
+        target_dist = float(target_dist)
+        same_venue  = str(run_venue) == str(target_venue)
+        dist_diff   = abs(run_dist - target_dist)
+    except Exception:
+        return 1.0
+
+    if same_venue and dist_diff == 0:     return 3.0
+    elif same_venue and dist_diff <= 200: return 2.0
+    elif same_venue and dist_diff <= 600: return 1.5
+    elif dist_diff == 0:                  return 1.2
+    elif dist_diff <= 200:                return 0.8
+    elif dist_diff <= 400:                return 0.5
+    else:                                 return 0.3
 
 WALK_DEFS = [
     {'n':1,'agari':'上り3F',  'rpci':'RPCI',  'venue':'場所',  'dist':'距離',
