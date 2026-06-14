@@ -164,7 +164,7 @@ COURSE_AGARI_BASE = {
 }
 
 def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
-                  predicted_pace_cat=None, pred_gap=None):
+                  predicted_pace_cat=None, pred_gap=None, pci_cs_score=None):
     """
     上がり予測 v3：全走平均Z + 先行×H消耗補正
 
@@ -213,6 +213,17 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
     pred_z  = round(pred_z, 3)
     all_z_list = [z for z, _ in weighted_zs]
 
+    # PCI追走スコアによるZ割引
+    # 速い前半ペースへの対応実績がない馬のZを割り引く
+    # ◎(≥2.0)→×1.0 / ○(0.5〜2.0)→×0.85 / △(-0.5〜0.5)→×0.70 / ×(<-0.5)→×0.55
+    pci_cs_coef = 1.0
+    if pci_cs_score is not None:
+        if pci_cs_score >= 2.0:    pci_cs_coef = 1.00
+        elif pci_cs_score >= 0.5:  pci_cs_coef = 0.85
+        elif pci_cs_score >= -0.5: pci_cs_coef = 0.70
+        else:                      pci_cs_coef = 0.55
+    pred_z = round(pred_z * pci_cs_coef, 3)
+
     # 安定度
     z_std = float(np.std(all_z_list, ddof=1)) if len(all_z_list) >= 2 else 0.8
     if z_std <= 0.4:   confidence = '◎安定'
@@ -228,10 +239,12 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
         grade, grade_label = 'B', '🟡 切れ味B'
 
     n_discounted = sum(1 for _, w in weighted_zs if w < 1.0)
-    comment = (f'全走Z平均={pred_z:+.2f}。'
+    comment = (f'全走Z平均={pred_z:+.2f}（PCI-CS係数×{pci_cs_coef:.2f}適用後）。'
                f'{"上位33%の切れ味" if grade=="A" else "下位33%の末脚" if grade=="C" else "標準的な末脚"}。')
     if n_discounted > 0:
         comment += f' 先行×H消耗走{n_discounted}件は重み0.3で補正済み。'
+    if pci_cs_coef < 1.0:
+        comment += f' PCI追走スコア{pci_cs_score:.2f}→Z×{pci_cs_coef:.2f}で割引。'
 
     # 予測上がり秒数（コース基準 − Z + 位置取り補正）
     course_base = COURSE_AGARI_BASE.get((float(target_dist), target_venue), 34.5)
@@ -757,7 +770,8 @@ def get_z(agari, dist, venue, baba, base_dict, 稍重_dict,
 # ============================================================
 def calc_lpi(entry_bytes, base_dict, 稍重_dict,
              target_track='T', target_venue='東京', bonus_strength=0.15,
-             pace_pred_rpci=51.0, race_base_dict=None, target_race_name=''):
+             pace_pred_rpci=51.0, race_base_dict=None, target_race_name='',
+             target_front_1f_input=None):
     for enc in ['cp932', 'shift_jis', 'utf-8-sig', 'utf-8']:
         try:
             df = pd.read_csv(io.BytesIO(entry_bytes), encoding=enc)
@@ -898,6 +912,12 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
 
         # 予測ポジション（地点差）を上がり予測に渡す
         _pred_gap = pos_pred['pred_gap'] if pos_pred else None
+        # PCI-CSスコアを上がり予測に渡す（target_front_1fが設定されている場合）
+        _pci_cs_score = None
+        if target_front_1f_input is not None and target_front_1f_input > 0:
+            _cs = calc_pci_cs(use[:5], target_front_1f_input)
+            _pci_cs_score = _cs['score'] if _cs else None
+
         agari_pred = predict_agari(
             past_runs           = use[:5],
             target_dist         = float(str(run_data[0]['dist']).replace('m','')),
@@ -905,6 +925,7 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
             target_baba         = '良',
             predicted_pace_cat  = _pace_cat,
             pred_gap            = _pred_gap,
+            pci_cs_score        = _pci_cs_score,
         )
 
         # ===== G1好走LPIボーナス（直近3走以内のG1好走に加算）=====
@@ -1138,6 +1159,7 @@ if run_btn or (base_file and entry_file):
             pace_pred_rpci=pace['pred_rpci'],
             race_base_dict=race_base_dict,
             target_race_name=race_name,
+            target_front_1f_input=target_front_1f if use_pci_cs else None,
         )
 
     if not results:
