@@ -177,8 +177,8 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
     """
     GRADE_THRESH = {'A': 0.458, 'C': -0.341}
 
-    weighted_zs = []
-
+    # 全有効走を収集
+    all_runs_data = []
     for r in past_runs:
         if r.get('excluded_baba') or r.get('excluded_track'):
             continue
@@ -186,23 +186,45 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
         if z is None or math.isnan(float(z)):
             continue
         z = float(z)
-
         rpci    = r.get('rpci', 50)
         gap_est = r.get('gap_est', 0.7)
-
-        # 先行×H走の消耗補正: 重みを0.3に下げる
-        is_senkou_H = (float(gap_est) <= 0.4 and float(rpci) <= 47)
-        weight = 0.3 if is_senkou_H else 1.0
-
-        # 追走能力ボーナス（速い前半×速い上がり）
-        fp_z = r.get('front_pace_z')
+        grade   = r.get('grade', '')
+        fp_z    = r.get('front_pace_z')
         chase_bonus = 0.0
         if fp_z is not None and not math.isnan(float(fp_z)):
             fp_z_f = float(fp_z)
             if fp_z_f < -0.3 and z > 0.3:
                 chase_bonus = round(min(abs(fp_z_f) * z * 0.15, 0.4), 3)
+        all_runs_data.append({
+            'z': z + chase_bonus, 'rpci': float(rpci),
+            'gap_est': float(gap_est), 'grade': grade,
+        })
 
-        weighted_zs.append((z + chase_bonus, weight))
+    if not all_runs_data:
+        return None
+
+    # PCI-CS△以下（pci_cs_score < 0.5）かつ G1/G2走がある場合
+    # → 下位クラスの高Zが水増しするため G1/G2走のZのみ使用
+    high_grade_runs = [r for r in all_runs_data if r['grade'] in ('G1','G2')]
+    use_high_grade_only = (
+        pci_cs_score is not None and
+        pci_cs_score < 0.5 and
+        len(high_grade_runs) >= 1
+    )
+    source_runs = high_grade_runs if use_high_grade_only else all_runs_data
+
+    # weighted_zs を構築
+    weighted_zs = []
+    for r in source_runs:
+        # 先行×H走の消耗補正
+        is_senkou_H = (r['gap_est'] <= 0.4 and r['rpci'] <= 47)
+        weight = 0.3 if is_senkou_H else 1.0
+        weighted_zs.append((r['z'], weight))
+
+    if not weighted_zs:
+        # G1/G2走しか使わないモードで0件の場合は全走を使う
+        weighted_zs = [(r['z'], 0.3 if (r['gap_est']<=0.4 and r['rpci']<=47) else 1.0)
+                       for r in all_runs_data]
 
     if not weighted_zs:
         return None
@@ -239,7 +261,10 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
         grade, grade_label = 'B', '🟡 切れ味B'
 
     n_discounted = sum(1 for _, w in weighted_zs if w < 1.0)
-    comment = (f'全走Z平均={pred_z:+.2f}（PCI-CS係数×{pci_cs_coef:.2f}適用後）。'
+    grade_filter_note = ''
+    if use_high_grade_only:
+        grade_filter_note = f'（PCI-CS△以下のためG1/G2走{len(high_grade_runs)}件のみ使用）'
+    comment = (f'全走Z平均={pred_z:+.2f}（PCI-CS係数×{pci_cs_coef:.2f}適用後）{grade_filter_note}。'
                f'{"上位33%の切れ味" if grade=="A" else "下位33%の末脚" if grade=="C" else "標準的な末脚"}。')
     if n_discounted > 0:
         comment += f' 先行×H消耗走{n_discounted}件は重み0.3で補正済み。'
