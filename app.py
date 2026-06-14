@@ -1458,6 +1458,16 @@ if run_btn or (base_file and entry_file):
                        r['agari_pred']['pred_agari'])
                       for r in results
                       if r.get('pos_pred') and r.get('agari_pred')]
+        # 安定度表示用
+        sim_stability = {
+            r['horse']: {
+                'agari_conf': r['agari_pred'].get('confidence','△不安定'),
+                'gap_conf':   r['pos_pred'].get('confidence','△不安定'),
+                'z_std':      r['agari_pred'].get('z_std', 0.5),
+                'gap_std':    r['pos_pred'].get('gap_std', 0.5),
+            }
+            for r in results if r.get('pos_pred') and r.get('agari_pred')
+        }
 
         if len(sim_horses) < 2:
             st.warning('予測ポジション・上がり予測が計算できた馬が2頭未満のため実行できません。')
@@ -1474,15 +1484,39 @@ if run_btn or (base_file and entry_file):
                 show_top3 = st.checkbox('複勝確率（3着以内）も表示', value=True)
 
             if st.button('▶️ シミュレーション実行', type='primary'):
-                # 誤差パラメータ（16,691走の実測値）
-                AGARI_ERR_STD = 1.065  # 上がり予測誤差のstd（秒）
-                GAP_ERR_STD   = 0.589  # 地点差予測誤差のstd（秒）
-
                 names      = [h[0] for h in sim_horses]
                 pred_gaps  = np.array([h[1] for h in sim_horses])
                 pred_agari = np.array([h[2] for h in sim_horses])
                 pred_total = pred_gaps + pred_agari
                 n_horses   = len(names)
+
+                # 馬個別の安定度をσに変換
+                # 上がり: agari_pred['z_std'] → σ_agari
+                # 地点差: pos_pred['gap_std'] → σ_gap（そのまま使用）
+                AGARI_BASE_STD = 1.065  # 全体の平均誤差std（フォールバック）
+                GAP_BASE_STD   = 0.589
+
+                sigma_agari = np.array([
+                    max(0.5, min(2.0,
+                        r['agari_pred']['z_std'] * 1.4
+                        if r.get('agari_pred') and r['agari_pred'].get('z_std')
+                        else AGARI_BASE_STD))
+                    for r in results if r.get('pos_pred') and r.get('agari_pred')
+                ])
+                sigma_gap = np.array([
+                    max(0.1, min(1.2,
+                        r['pos_pred']['gap_std']
+                        if r.get('pos_pred') and r['pos_pred'].get('gap_std')
+                        else GAP_BASE_STD))
+                    for r in results if r.get('pos_pred') and r.get('agari_pred')
+                ])
+                # z_std（上がり不安定度）を記録
+                z_stds = np.array([
+                    r['agari_pred']['z_std']
+                    if r.get('agari_pred') and r['agari_pred'].get('z_std')
+                    else 0.5
+                    for r in results if r.get('pos_pred') and r.get('agari_pred')
+                ])
 
                 wins  = np.zeros(n_horses)
                 top3s = np.zeros(n_horses)
@@ -1490,9 +1524,18 @@ if run_btn or (base_file and entry_file):
                 np.random.seed(None)
                 with st.spinner(f'{n_trials:,}回シミュレーション中...'):
                     for _ in range(n_trials):
-                        sim_gaps   = pred_gaps  + np.random.normal(0, GAP_ERR_STD,   n_horses)
-                        sim_agaris = pred_agari + np.random.normal(0, AGARI_ERR_STD, n_horses)
-                        sim_gaps   = np.maximum(0, sim_gaps)
+                        # 地点差: 個別σで正規分布
+                        sim_gaps = np.maximum(0,
+                            pred_gaps + np.random.normal(0, sigma_gap))
+
+                        # 上がり: 個別σ + 不安定馬は上方向（速い側）を抑制
+                        base_noise = np.random.normal(0, sigma_agari)
+                        for i in range(n_horses):
+                            if z_stds[i] > 0.7 and base_noise[i] < 0:
+                                # 不安定馬の「速い方向」ばらつきを半減
+                                base_noise[i] *= 0.5
+                        sim_agaris = pred_agari + base_noise
+
                         sim_totals = sim_gaps + sim_agaris
                         order      = np.argsort(sim_totals)
                         wins[order[0]]   += 1
@@ -1504,11 +1547,14 @@ if run_btn or (base_file and entry_file):
                     wp = wins[i]  / n_trials * 100
                     pp = top3s[i] / n_trials * 100
                     lpi_rank = next((j+1 for j,r in enumerate(results) if r['horse']==names[i]), '-')
+                    stab = sim_stability.get(names[i], {})
                     sim_rows.append({
                         '勝利確率順':  i+1,
                         '馬名':        names[i],
                         'LPI順位':     lpi_rank,
                         '予測通過T':   f'{pred_total[i]:.2f}秒',
+                        '上がり安定':  stab.get('agari_conf','-'),
+                        'gap安定':     stab.get('gap_conf','-'),
                         '勝利確率':    f'{wp:.1f}%',
                         '複勝確率':    f'{pp:.1f}%',
                         '勝利回数':    int(wins[i]),
@@ -1527,7 +1573,8 @@ if run_btn or (base_file and entry_file):
                     if rank == 3: return ['background-color:#BF360C;color:#fff;font-weight:bold']*len(row)
                     return ['']*len(row)
 
-                display_cols = ['勝利確率順','馬名','LPI順位','予測通過T','勝利確率']
+                display_cols = ['勝利確率順','馬名','LPI順位','予測通過T',
+                                '上がり安定','gap安定','勝利確率']
                 if show_top3:
                     display_cols.append('複勝確率')
 
@@ -1542,8 +1589,9 @@ if run_btn or (base_file and entry_file):
                 # 補足
                 st.caption(
                     f'試行回数: {n_trials:,}回 ／ '
-                    f'上がり誤差±{AGARI_ERR_STD:.2f}秒（1σ）／ '
-                    f'地点差誤差±{GAP_ERR_STD:.2f}秒（1σ）'
+                    f'上がりσ: 馬個別（z_std×1.4, 範囲0.5〜2.0秒）／ '
+                    f'地点差σ: 馬個別（gap_std, 範囲0.1〜1.2秒）／ '
+                    f'不安定馬（z_std>0.7）は速い方向のばらつきを半減'
                 )
                 st.info(
                     '💡 勝利確率はLPI順位と異なる場合があります。'
