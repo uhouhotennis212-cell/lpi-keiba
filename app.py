@@ -156,6 +156,64 @@ def calc_cushion_adj(cushion_val, base_cushion=9.0, coef=0.15):
         return 0.0
     return round((base_cushion - float(cushion_val)) * coef, 3)
 
+
+# ============================================================
+# ペース調整済みZスコア用 回帰係数テーブル
+# 基準上がり = intercept + slope × 前半1F平均
+# データ: 2020〜2026年全重賞 良馬場 (scipy.stats.linregress)
+# 使用条件: PCI追走スコア機能がONかつtarget_front_1fが設定されている場合
+# ============================================================
+PACE_REGRESSION = {
+    # (距離, 競馬場): (slope, intercept, r)
+    (1000,'新潟'): (-0.9014, 43.1328, -0.245),
+    (1200,'中京'): (-0.8246, 43.5797, -0.235),
+    (1200,'中山'): (-2.3241, 60.6847, -0.384),
+    (1200,'京都'): (-1.0894, 46.6041, -0.288),
+    (1200,'函館'): (-0.6987, 42.7827, -0.185),
+    (1200,'阪神'): (-2.5037, 62.9901, -0.522),
+    (1400,'中京'): (-2.4420, 63.1369, -0.408),
+    (1400,'京都'): (-0.7545, 43.1096, -0.216),
+    (1400,'新潟'): (-2.1218, 59.7741, -0.524),
+    (1400,'阪神'): (-1.8358, 56.0789, -0.371),
+    (1600,'中京'): (-2.0492, 59.2988, -0.424),
+    (1600,'京都'): (-1.3379, 50.5699, -0.228),
+    (1600,'新潟'): (-1.2365, 48.9491, -0.281),
+    (1600,'東京'): (-1.8148, 55.7700, -0.393),
+    (1600,'阪神'): (-2.7806, 67.3822, -0.536),
+    (1800,'中山'): (-1.3497, 51.7929, -0.264),
+    (1800,'京都'): (-1.7638, 55.8201, -0.487),
+    (1800,'函館'): (-2.0303, 60.1176, -0.299),
+    (1800,'小倉'): (-3.8866, 81.7728, -0.463),
+    (1800,'新潟'): (-2.4851, 63.9123, -0.560),
+    (1800,'東京'): (-1.5440, 52.8859, -0.399),
+    (1800,'阪神'): (-1.7165, 55.0031, -0.426),
+    (2000,'中京'): (-1.9410, 58.6839, -0.400),
+    (2000,'函館'): (-4.1172, 85.4790, -0.384),
+    (2000,'小倉'): (-2.7953, 69.3979, -0.352),
+    (2000,'新潟'): (-5.4022,100.2316, -0.746),
+    (2000,'東京'): (-2.5017, 64.7120, -0.430),
+    (2000,'阪神'): (-1.6045, 54.8995, -0.253),
+    (2200,'中京'): (-3.2844, 75.9519, -0.330),
+    (2200,'京都'): (-3.5713, 78.6825, -0.585),
+    (2200,'阪神'): (-3.4860, 77.8011, -0.535),
+    (2400,'京都'): (-3.3681, 76.8036, -0.554),
+    (2400,'東京'): (-3.2628, 74.8698, -0.337),
+    (2500,'中山'): (-1.7467, 57.7793, -0.188),
+    (2500,'東京'): (-4.0804, 85.1470, -0.632),
+}
+
+def get_pace_adjusted_base(dist, venue, target_front_1f):
+    """
+    今回のペース（target_front_1f）に対応したコース基準上がりを返す。
+    回帰式: 基準 = intercept + slope × target_front_1f
+    登録なし → None（固定基準を使う）
+    """
+    key = (float(dist), str(venue))
+    if key not in PACE_REGRESSION:
+        return None
+    slope, intercept, r = PACE_REGRESSION[key]
+    return round(intercept + slope * target_front_1f, 3)
+
 # 競馬場×距離の基準上がり（上がり予測の補正に使用）
 # 対象コースで上がりが速くなる/遅くなる傾向を補正
 COURSE_AGARI_BASE = {
@@ -176,7 +234,8 @@ COURSE_AGARI_BASE = {
 
 def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
                   predicted_pace_cat=None, pred_gap=None, pci_cs_score=None,
-                  cushion_correction=0.0):
+                  cushion_correction=0.0, base_dict_for_z=None,
+                  pace_target_front_1f=None):
     """
     上がり予測 v3：全走平均Z + 先行×H消耗補正
 
@@ -190,6 +249,7 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
     GRADE_THRESH = {'A': 0.458, 'C': -0.341}
 
     # 全有効走を収集
+    # target_front_1fが設定されている場合はペース調整済みZを使う
     all_runs_data = []
     for r in past_runs:
         if r.get('excluded_baba') or r.get('excluded_track'):
@@ -201,14 +261,43 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
         rpci    = r.get('rpci', 50)
         gap_est = r.get('gap_est', 0.7)
         grade   = r.get('grade', '')
+        agari   = r.get('agari')
+        dist    = r.get('dist')
+        venue   = r.get('venue')
         fp_z    = r.get('front_pace_z')
+        pci     = r.get('pci')
+
+        # ペース調整済みZ: target_front_1f が設定かつPCI既知の走
+        z_use = z  # デフォルトは固定基準Z
+        if (pci_cs_score is not None and
+                target_dist is not None and target_venue is not None and
+                pci is not None and agari is not None):
+            # その走の前半1F
+            try:
+                pci_f   = float(pci); agari_f = float(agari)
+                run_front_1f = (pci_f + 50) * agari_f / 100 / 3
+                # その走のペースに対応した基準上がり
+                pace_base = get_pace_adjusted_base(
+                    float(str(dist).replace('m','')),
+                    str(venue),
+                    run_front_1f
+                )
+                if pace_base is not None:
+                    # stdは通常の基準テーブルから
+                    _, std_val = base_dict_for_z.get(
+                        (float(str(dist).replace('m','')), str(venue)), (pace_base, 1.0))
+                    std_val = std_val if std_val and std_val > 0 else 1.0
+                    z_use = (pace_base - agari_f) / std_val
+            except Exception:
+                z_use = z  # フォールバック
+
         chase_bonus = 0.0
         if fp_z is not None and not math.isnan(float(fp_z)):
             fp_z_f = float(fp_z)
-            if fp_z_f < -0.3 and z > 0.3:
-                chase_bonus = round(min(abs(fp_z_f) * z * 0.15, 0.4), 3)
+            if fp_z_f < -0.3 and z_use > 0.3:
+                chase_bonus = round(min(abs(fp_z_f) * z_use * 0.15, 0.4), 3)
         all_runs_data.append({
-            'z': z + chase_bonus, 'rpci': float(rpci),
+            'z': z_use + chase_bonus, 'rpci': float(rpci),
             'gap_est': float(gap_est), 'grade': grade,
         })
 
@@ -284,7 +373,24 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
         comment += f' PCI追走スコア{pci_cs_score:.2f}→Z×{pci_cs_coef:.2f}で割引。'
 
     # 予測上がり秒数（コース基準 − Z + 位置取り補正 + クッション値補正）
-    course_base = COURSE_AGARI_BASE.get((float(target_dist), target_venue), 34.5)
+    # PCI追走がONかつtarget_front_1fが設定されている場合はペース調整済み基準を使用
+    _target_front = None
+    if pci_cs_score is not None:
+        # target_front_1f は pci_cs_score の元情報から推定できないので
+        # PACE_REGRESSIONのキーとなる固定基準を使う
+        # （今回のペース基準はPCI-CS計算時のtarget_front_1fと同じ値）
+        # calc_lpi 側から pace_target_front_1f として渡す
+        pass
+    if pace_target_front_1f is not None:
+        pace_adj_base = get_pace_adjusted_base(
+            float(target_dist), str(target_venue), pace_target_front_1f)
+    else:
+        pace_adj_base = None
+
+    if pace_adj_base is not None:
+        course_base = pace_adj_base
+    else:
+        course_base = COURSE_AGARI_BASE.get((float(target_dist), target_venue), 34.5)
     if str(target_baba).strip() == '稍':
         course_base += 0.4
     # クッション値補正を加算
@@ -967,6 +1073,8 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
             pred_gap            = _pred_gap,
             pci_cs_score        = _pci_cs_score,
             cushion_correction  = cushion_correction_input,
+            base_dict_for_z     = base_dict,
+            pace_target_front_1f= target_front_1f_input,
         )
 
         # ===== G1好走LPIボーナス（直近3走以内のG1好走に加算）=====
