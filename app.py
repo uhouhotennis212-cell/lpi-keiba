@@ -1981,8 +1981,6 @@ if run_btn or (base_file and entry_file):
 # ============================================================
 # フッター
 # ============================================================
-st.markdown('---')
-st.caption('LPI v11 | 基準: 2023〜2026年全距離重賞 | 良・稍重有効 | グレード加重平均 | 斤量補正あり')
 import re
 import io
 import pandas as pd
@@ -2055,51 +2053,77 @@ def split_multi_race_csv(file_bytes):
 # ============================================================
 VENUE_NAMES = ['東京', '中山', '京都', '阪神', '新潟', '中京', '福島', '小倉', '札幌', '函館']
 
-# 例: "4レース 3歳未勝利 1,600（芝） 11:35" / "4R 3歳未勝利 1600(芝) 11:35"
-#     "9レース 香港ジョッキークラブトロフィー 3歳以上2勝クラス 2,000（芝）混 14:25"
-RACE_LINE_RE = re.compile(
-    r'(\d{1,2})\s*[RレースＲ]+.*?([\d,，]{3,5})\s*m?\s*[（(]\s*(芝|ダート|ダ)(?:[・][^）)]*)?\s*[)）]',
+# 例:
+#   1
+#   レース
+#   3歳未勝利
+#   1,400（ダ）（牝）
+#   10時05分
+# のように「レース番号」「レース」「クラス名」「距離（芝/ダ）」「発走時刻」が
+# それぞれ別の行に分かれる、JRA公式サイトを実際にブラウザでコピペした形式に対応。
+DIST_TRACK_RE = re.compile(
+    r'([\d,，]{3,5})\s*[（(]\s*(芝|ダート|ダ)(?:[・][^）)]*)?\s*[)）]'
 )
 
 def parse_jra_program(text):
     """
-    JRA公式サイトの「開催日程（番組表）」ページ等からコピペしたテキストを解析し、
-    会場ごとのレース一覧（R番号・距離・トラック・クラス名）を返す。
+    JRA公式サイトの「開催日程（番組表）」ページからブラウザでそのままコピペした
+    テキストを解析し、会場ごとのレース一覧（R番号・距離・トラック）を返す。
 
-    厳密なフォーマットは要求しない（コピペ時の改行崩れなどに耐えるよう、
-    「N R ... 距離（芝/ダート）」というパターンをテキスト全体から拾う方式）。
-    会場名の行（東京/中山/...などが単独、または「◯回東京◯日目」のように
-    含まれる行）が出てきたら、以降のレースをその会場に割り当てる。
+    実際のコピペ結果は「レース番号」「レース」「クラス名」「距離（芝/ダ）」「発走時刻」
+    がそれぞれ別行になる（表のセルが縦に展開される）ため、行単位ではなく
+    「数字だけの行の直後に'レース'という行がある」＝レコード開始、として検出し、
+    そこから数行以内にある距離パターンを探す方式にしている。
 
-    Returns: list of dict [{'venue','race_no','dist','track','line_text'}], 出現順
+    Returns: list of dict [{'venue','race_no','dist','track'}], 出現順
     """
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    lines = [l.strip() for l in text.splitlines()]
     results = []
     current_venue = None
+    i, n = 0, len(lines)
 
-    for line in lines:
-        # 会場名を含む行か判定（レース行と誤認しないよう、距離パターンを含まない行のみ）
-        if not RACE_LINE_RE.search(line):
+    while i < n:
+        line = lines[i]
+        if not line:
+            i += 1
+            continue
+
+        # レコード開始判定: 「1〜2桁の数字だけの行」の直後が「レース」という行
+        is_record_start = (
+            bool(re.fullmatch(r'\d{1,2}', line))
+            and i + 1 < n
+            and lines[i + 1].strip() == 'レース'
+        )
+        if not is_record_start:
+            # 会場名を含む行（例:「3回東京2日」）が出てきたら以降の会場を更新
             for v in VENUE_NAMES:
                 if v in line:
                     current_venue = v
                     break
+            i += 1
             continue
 
-        m = RACE_LINE_RE.search(line)
-        if not m:
-            continue
-        race_no = int(m.group(1))
-        dist = float(m.group(2).replace(',', '').replace('，', ''))
-        track = 'D' if m.group(3) in ('ダート', 'ダ') else 'T'
-
-        results.append({
-            'venue': current_venue or '(不明)',
-            'race_no': race_no,
-            'dist': dist,
-            'track': track,
-            'line_text': line[:40],
-        })
+        race_no = int(line)
+        # レース番号行・「レース」行の次から、距離パターンが見つかるまで数行探す
+        j = i + 2
+        found = False
+        search_limit = min(j + 8, n)  # 重賞名などで行数が増えても耐えられるよう余裕を持たせる
+        while j < search_limit:
+            m = DIST_TRACK_RE.search(lines[j])
+            if m:
+                dist = float(m.group(1).replace(',', '').replace('，', ''))
+                track = 'D' if m.group(2) in ('ダート', 'ダ') else 'T'
+                results.append({
+                    'venue': current_venue or '(不明)',
+                    'race_no': race_no,
+                    'dist': dist,
+                    'track': track,
+                })
+                found = True
+                j += 1
+                break
+            j += 1
+        i = j if found else i + 1
 
     return results
 
@@ -2152,8 +2176,10 @@ with st.expander('📅 1日厳選5レースを使う', expanded=False):
     )
     program_text = st.text_area(
         '番組表テキスト', height=200, key='daily_program_text',
-        placeholder='例:\n東京\n1レース 3歳未勝利 1,400（ダート）（外） 10:05\n'
-                    '...\n4レース 3歳未勝利 1,600（芝） 11:35\n...\n阪神\n2レース 3歳未勝利 1,800（芝・外） 10:20\n...'
+        placeholder='JRA開催日程ページの表をそのままコピペ（例）:\n'
+                    '3回東京2日\nレース\n番号\nレース名・条件\t発走時刻\n'
+                    '1\nレース\n3歳未勝利\n1,400（ダ）（牝）\n10時05分\n'
+                    '2\nレース\n3歳未勝利\n2,100（ダ）\n10時35分\n...'
     )
     target_track_filter = st.radio('抽出するトラック', ['芝', 'ダート'], horizontal=True, key='daily_track_filter')
 
@@ -2204,7 +2230,6 @@ with st.expander('📅 1日厳選5レースを使う', expanded=False):
                         'R': p['race_no'] if p else None,
                         '距離': p['dist'] if p else None,
                         'トラック': track_code,
-                        '検出テキスト': p['line_text'] if p else '',
                     })
 
                 st.session_state['daily_races'] = races
@@ -2220,7 +2245,7 @@ with st.expander('📅 1日厳選5レースを使う', expanded=False):
                 '距離': st.column_config.NumberColumn('距離(m)', min_value=800, max_value=3600, step=100),
                 'トラック': st.column_config.SelectboxColumn('トラック', options=['T', 'D']),
             },
-            disabled=['block_no', '頭数', '検出テキスト'],
+            disabled=['block_no', '頭数'],
             hide_index=True,
             use_container_width=True,
             key='daily_map_editor',
