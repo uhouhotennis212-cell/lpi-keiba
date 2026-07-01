@@ -1983,6 +1983,11 @@ if run_btn or (base_file and entry_file):
 # ============================================================
 st.markdown('---')
 st.caption('LPI v11 | 基準: 2023〜2026年全距離重賞 | 良・稍重有効 | グレード加重平均 | 斤量補正あり')
+import re
+import io
+import pandas as pd
+import streamlit as st
+
 # ============================================================
 # 1日厳選5レース機能 v3
 # ------------------------------------------------------------
@@ -2257,7 +2262,7 @@ with st.expander('📅 1日厳選5レースを使う', expanded=False):
                         # cp932の方がshift_jisよりカバー範囲が広く文字化けしにくい
                         csv_bytes = block.to_csv(index=False).encode('cp932', errors='replace')
 
-                        if abs(r_dist - 1200) <= 100 and r_track == 'T':
+                        if abs(r_dist - 1200) <= 100 and r_track == 'T' and 'calc_lpi_1200m' in globals():
                             results = calc_lpi_1200m(
                                 csv_bytes, d_base_dict, d_稍重_dict,
                                 target_venue=r_venue, target_grade='G3',
