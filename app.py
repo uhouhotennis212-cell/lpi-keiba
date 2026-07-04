@@ -888,13 +888,29 @@ def build_base_table(file_bytes):
     else:
         raise ValueError('CSVの文字コードを判定できませんでした')
 
+    # ===== 新形式(年/月/日が別列、場所、上がり3Fタイム等)を検出して旧形式に変換 =====
+    # 例: 2020-2025平場結果.csv のようなJRA-VAN生データ形式
+    is_new_schema = '上り3F' not in df.columns and '上がり3Fタイム' in df.columns
+    if is_new_schema:
+        if {'年', '月', '日'}.issubset(df.columns):
+            df['日付'] = (df['年'].astype(int) * 10000 +
+                          df['月'].astype(int) * 100 +
+                          df['日'].astype(int))
+        if '開催' not in df.columns and '場所' in df.columns:
+            df['開催'] = df['場所']
+        if '上り3F' not in df.columns and '上がり3Fタイム' in df.columns:
+            df['上り3F'] = df['上がり3Fタイム']
+        if '距離' in df.columns:
+            # 数値のみの距離を文字列化(str.extractは既に astype(str) 済みなのでこのままでOK)
+            pass
+
     df['距離_num'] = df['距離'].astype(str).str.extract(r'(\d+)').astype(float)
     df['上がり']   = pd.to_numeric(df['上り3F'], errors='coerce')
     df['競馬場']   = df['開催'].apply(get_venue_from_kaisan)
-    df['馬場']  = df['馬場状態'].astype(str).str.strip()
+    df['馬場']     = df['馬場状態'].astype(str).str.strip()
     df['日付_num'] = pd.to_numeric(df['日付'], errors='coerce')
     df['年']       = (df['日付_num'] // 10000).fillna(0).astype(int)
-    df['レース名_s'] = df['レース名'].str.strip() if 'レース名' in df.columns else ''
+    df['レース名_s'] = df['レース名'].astype(str).str.strip() if 'レース名' in df.columns else ''
 
     # ===== 年度重み（直近ほど重い）=====
     def yr_weight(y):
@@ -1940,6 +1956,11 @@ if run_btn or (base_file and entry_file):
                     'LPI上位でも通過Tが遅い馬は勝利確率が低く出ます。'
                 )
 
+# ============================================================
+# フッター
+# ============================================================
+st.markdown('---')
+st.caption('LPI v11 | 展開ボーナス対応版 | 2024-2025年バックテスト済み設定 | 平場基準推奨 | 会場適性ボーナスON・G1好走ボーナスOFF既定')
 # ============================================================
 # フッター
 # ============================================================
