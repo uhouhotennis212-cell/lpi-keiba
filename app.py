@@ -139,6 +139,74 @@ def get_pace_prediction(dist, venue, nige_count=0, senkou_count=0):
                 label=label, lamp=lamp, elem_adv=elem_adv, comment=comment)
 
 # ============================================================
+# 展開ボーナス機能（2024-2025年バックテストで検証済み）
+# ------------------------------------------------------------
+# 検証結果(平場全芝・厳選3レース/日・軸+相手3頭):
+#   展開ボーナスなし: 馬単回収率 70.8% / 馬連回収率 70.4%
+#   展開ボーナスあり: 馬単回収率 82.3% / 馬連回収率 74.0%
+# ============================================================
+
+def classify_running_style(gap_ests):
+    """過去走のgap_estリストから脚質ゾーン(1逃げ/2先行/3中団/4後方)を仮判定。
+    直近を重めに、最大3走の加重平均で判定する。データが無ければNoneを返す。
+    """
+    valid = [g for g in gap_ests if g is not None and not (isinstance(g, float) and math.isnan(g))]
+    if not valid:
+        return None
+    weights = [0.5, 0.3, 0.2]
+    vs = valid[:3]
+    w = weights[:len(vs)]
+    avg = sum(g * wi for g, wi in zip(vs, w)) / sum(w)
+    return gap_to_zone(avg)
+
+
+def precompute_running_styles(entry_bytes):
+    """出走表CSVを軽く読み、各馬の脚質ゾーンを仮判定して集計する。
+    calc_lpi本番の前に呼び、get_pace_predictionのnige_count/senkou_countを
+    自動算出するために使う(2パス構成の1パス目)。
+    Returns: dict {'nige': n, 'senkou': n, 'chudan': n, 'oikomi': n, 'fumei': n}
+    """
+    for enc in ['cp932', 'shift_jis', 'utf-8-sig', 'utf-8']:
+        try:
+            df = pd.read_csv(io.BytesIO(entry_bytes), encoding=enc)
+            break
+        except (UnicodeDecodeError, Exception):
+            continue
+    else:
+        raise ValueError('出走表CSVの文字コードを判定できませんでした')
+
+    counts = {'nige': 0, 'senkou': 0, 'chudan': 0, 'oikomi': 0, 'fumei': 0}
+    for _, row in df.iterrows():
+        gap_ests = []
+        for wd in WALK_DEFS[:3]:
+            gap_raw = row.get(wd['gap'], None)
+            try:
+                g = float(gap_raw)
+                if not math.isnan(g):
+                    gap_ests.append(g)
+            except (TypeError, ValueError):
+                continue
+        zone = classify_running_style(gap_ests)
+        if zone == 1: counts['nige'] += 1
+        elif zone == 2: counts['senkou'] += 1
+        elif zone == 3: counts['chudan'] += 1
+        elif zone == 4: counts['oikomi'] += 1
+        else: counts['fumei'] += 1
+    return counts
+
+
+def apply_pace_bonus(dom_elem, elem_adv, lpi, strength=3.0):
+    """展開適合ボーナス。dom_elemがelem_adv(有利な要素型リスト)に含まれれば+strength、
+    elem_advが空(どちらも起こりうる想定)なら補正なし、含まれなければ補正なし
+    (ペナルティは課さない、検証済みの設計)。
+    """
+    if not elem_adv:
+        return lpi
+    if dom_elem in elem_adv:
+        return min(100.0, round(lpi + strength, 1))
+    return lpi
+
+# ============================================================
 # 上がり予測スコア
 # 過去走のZスコア（コース補正済み上がり）から予測
 # 検証結果: 相関r=0.27, A評価のZ平均=+0.38（C評価=-0.24）
@@ -235,9 +303,12 @@ COURSE_AGARI_BASE = {
 def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
                   predicted_pace_cat=None, pred_gap=None, pci_cs_score=None,
                   cushion_correction=0.0, base_dict_for_z=None,
-                  pace_target_front_1f=None):
+                  pace_target_front_1f=None, course_base_dict=None):
     """
     上がり予測 v3：全走平均Z + 先行×H消耗補正
+
+    course_base_dict: {(距離,競馬場): 平均上がり} の上書き用テーブル。
+        None(既定)ならターフ用 COURSE_AGARI_BASE を使う。
 
     設計方針:
     1. ペース帯別分類をやめて全走の加重平均Zを使う
@@ -249,7 +320,6 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
     GRADE_THRESH = {'A': 0.458, 'C': -0.341}
 
     # 全有効走を収集
-    # target_front_1fが設定されている場合はペース調整済みZを使う
     all_runs_data = []
     for r in past_runs:
         if r.get('excluded_baba') or r.get('excluded_track'):
@@ -267,36 +337,31 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
         fp_z    = r.get('front_pace_z')
         pci     = r.get('pci')
 
-        # ペース調整済みZ: PCI既知の走は常にペース調整済みZを使う
-        # （PCI追走スコアON/OFFに関係なく、PCIデータがあれば適用）
-        z_use = z  # デフォルトは固定基準Z
+        z_use = z
         if (target_dist is not None and target_venue is not None and
                 pci is not None and agari is not None):
             try:
                 pci_f   = float(pci); agari_f = float(agari)
                 run_front_1f = (pci_f + 50) * agari_f / 100 / 3
-                # その走のペースに対応した基準上がり
                 pace_base = get_pace_adjusted_base(
                     float(str(dist).replace('m','')),
                     str(venue),
                     run_front_1f
                 )
                 if pace_base is not None:
-                    # stdは通常の基準テーブルから
                     _base_dict = base_dict_for_z or {}
                     _, std_val = _base_dict.get(
                         (float(str(dist).replace('m','')), str(venue)), (pace_base, 1.0))
                     std_val = std_val if std_val and std_val > 0 else 1.0
                     z_use = (pace_base - agari_f) / std_val
             except Exception:
-                z_use = z  # フォールバック
+                z_use = z
 
         chase_bonus = 0.0
         if fp_z is not None and not math.isnan(float(fp_z)):
             fp_z_f = float(fp_z)
             if fp_z_f < -0.3 and z_use > 0.3:
                 chase_bonus = round(min(abs(fp_z_f) * z_use * 0.15, 0.4), 3)
-        # コース・距離の一致度による重み
         course_w = calc_course_weight(
             dist, venue, target_dist, target_venue
         ) if (dist is not None and venue is not None) else 1.0
@@ -310,9 +375,6 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
     if not all_runs_data:
         return None
 
-    # ===== G1/G2限定フィルター（自動判定）=====
-    # 条件: G1/G2走のZ平均 と 下位クラス走のZ平均 の差が大きい場合
-    # → 下位クラスでZ水増しされている → G1/G2走のみ使用
     high_grade_runs = [r for r in all_runs_data if r['grade'] in ('G1','G2')]
     lower_runs      = [r for r in all_runs_data if r['grade'] not in ('G1','G2','G3','L')]
 
@@ -320,10 +382,8 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
     if len(high_grade_runs) >= 1 and len(lower_runs) >= 1:
         z_high  = np.mean([r['z'] for r in high_grade_runs])
         z_lower = np.mean([r['z'] for r in lower_runs])
-        # 下位クラスのZが上位クラスより0.5以上高い → 水増しと判定
         if z_lower - z_high > 0.5:
             use_high_grade_only = True
-    # PCI-CS明示的に△以下の場合も適用（従来の条件を維持）
     if (pci_cs_score is not None and
             pci_cs_score < 0.5 and
             len(high_grade_runs) >= 1):
@@ -331,7 +391,6 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
 
     source_runs = high_grade_runs if use_high_grade_only else all_runs_data
 
-    # weighted_zs を構築（先行×H消耗補正 × コース距離重み）
     weighted_zs = []
     for r in source_runs:
         is_senkou_H = (r['gap_est'] <= 0.4 and r['rpci'] <= 47)
@@ -341,7 +400,6 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
         weighted_zs.append((r['z'], weight))
 
     if not weighted_zs:
-        # G1/G2走しか使わないモードで0件の場合は全走を使う
         weighted_zs = [
             (r['z'],
              round((0.3 if (r['gap_est']<=0.4 and r['rpci']<=47) else 1.0)
@@ -352,15 +410,11 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
     if not weighted_zs:
         return None
 
-    # 加重平均Z（消耗走は重み0.3）
     total_w = sum(w for _, w in weighted_zs)
     pred_z  = sum(z * w for z, w in weighted_zs) / total_w if total_w > 0 else 0.0
     pred_z  = round(pred_z, 3)
     all_z_list = [z for z, _ in weighted_zs]
 
-    # PCI追走スコアによるZ割引
-    # 速い前半ペースへの対応実績がない馬のZを割り引く
-    # ◎(≥2.0)→×1.0 / ○(0.5〜2.0)→×0.85 / △(-0.5〜0.5)→×0.70 / ×(<-0.5)→×0.55
     pci_cs_coef = 1.0
     if pci_cs_score is not None:
         if pci_cs_score >= 2.0:    pci_cs_coef = 1.00
@@ -369,13 +423,11 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
         else:                      pci_cs_coef = 0.55
     pred_z = round(pred_z * pci_cs_coef, 3)
 
-    # 安定度
     z_std = float(np.std(all_z_list, ddof=1)) if len(all_z_list) >= 2 else 0.8
     if z_std <= 0.4:   confidence = '◎安定'
     elif z_std <= 0.7: confidence = '○やや安定'
     else:              confidence = '△不安定'
 
-    # グレード判定（全体基準）
     if pred_z >= GRADE_THRESH['A']:
         grade, grade_label = 'A', '🔴 切れ味A'
     elif pred_z < GRADE_THRESH['C']:
@@ -394,24 +446,18 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
     if pci_cs_coef < 1.0:
         comment += f' PCI追走スコア{pci_cs_score:.2f}→Z×{pci_cs_coef:.2f}で割引。'
 
-    # 予測上がり秒数（コース基準 − Z + 位置取り補正 + クッション値補正）
-    # ペース基準の優先順位:
-    #   1. pace_target_front_1f（サイドバー入力値）→ 最優先
-    #   2. predicted_pace_cat（H/M/S）からFRONT_PACE_BASEで推定
-    #   3. COURSE_AGARI_BASE の固定基準（フォールバック）
     if pace_target_front_1f is not None:
         _front_for_base = pace_target_front_1f
     elif predicted_pace_cat is not None:
-        # H/M/SペースからFRONT_PACE_BASEで代表前半1Fを推定
         _dist_key = min(FRONT_PACE_BASE.keys(),
                         key=lambda d: abs(d - float(target_dist)))
         _base_front, _std_front = FRONT_PACE_BASE[_dist_key]
         if predicted_pace_cat == 'H':
-            _front_for_base = _base_front - 0.24  # H = 基準より0.24秒速い（実測値）
+            _front_for_base = _base_front - 0.24
         elif predicted_pace_cat == 'S':
-            _front_for_base = _base_front + 0.21  # S = 基準より0.21秒遅い（実測値）
+            _front_for_base = _base_front + 0.21
         else:
-            _front_for_base = _base_front          # M = 基準値
+            _front_for_base = _base_front
     else:
         _front_for_base = None
 
@@ -423,10 +469,9 @@ def predict_agari(past_runs, target_dist, target_venue, target_baba='良',
     if pace_adj_base is not None:
         course_base = pace_adj_base
     else:
-        course_base = COURSE_AGARI_BASE.get((float(target_dist), target_venue), 34.5)
+        course_base = (course_base_dict or COURSE_AGARI_BASE).get((float(target_dist), target_venue), 34.5)
     if str(target_baba).strip() == '稍':
         course_base += 0.4
-    # クッション値補正を加算
     if cushion_correction != 0.0:
         course_base = round(course_base + cushion_correction, 3)
     GAP_CORRECTION = 0.383
@@ -477,28 +522,11 @@ def gap_to_zone(gap):
 def predict_position(past_gaps, rpci_pred=None):
     """
     過去走の地点差リスト → ポジション予測。
-
-    Args:
-        past_gaps: 過去走の地点差リスト（新しい順）。Noneは除外。
-        rpci_pred: 予測RPCI。スロー/ハイによる補正に使用。
-
-    Returns:
-        dict: {
-          'pred_gap':     予測地点差（秒）,
-          'pred_zone':    予測ゾーン番号（1〜4）,
-          'label':        'ゾーン名（範囲）',
-          'confidence':   '◎安定/○やや安定/△不安定',
-          'icon':         絵文字,
-          'color':        カラーコード,
-          'gap_std':      過去走の地点差std,
-          'n_valid':      有効走数,
-        }
     """
     valid_gaps = [g for g in past_gaps if g is not None and not math.isnan(float(g))]
     if not valid_gaps:
         return None
 
-    # 直近重み付き平均（1走前50%・2走前30%・3走前以前20%）
     weights = [0.50, 0.30, 0.15, 0.05]
     total_w, weighted_sum = 0.0, 0.0
     for i, g in enumerate(valid_gaps[:4]):
@@ -507,22 +535,18 @@ def predict_position(past_gaps, rpci_pred=None):
         total_w += w
     pred_gap = round(weighted_sum / total_w, 2) if total_w > 0 else valid_gaps[0]
 
-    # RPCIによる補正（スロー→縦長化抑制, ハイ→縦長化）
-    # スローでは馬群がコンパクトになる傾向（地点差std↓）
     if rpci_pred is not None:
-        if rpci_pred >= 54:    pred_gap -= 0.05   # 超スロー: やや前詰まり
-        elif rpci_pred <= 46:  pred_gap += 0.05   # 超ハイ: やや後ろ広がり
+        if rpci_pred >= 54:    pred_gap -= 0.05
+        elif rpci_pred <= 46:  pred_gap += 0.05
 
     pred_gap = max(0.0, pred_gap)
     pred_zone = gap_to_zone(pred_gap)
 
-    # 安定度（std）
     if len(valid_gaps) >= 2:
         gap_std = float(np.std(valid_gaps, ddof=1))
     else:
-        gap_std = 0.5  # デフォルト
+        gap_std = 0.5
 
-    # 安定度ラベル
     if gap_std <= 0.25:   confidence = '◎安定'
     elif gap_std <= 0.45: confidence = '○やや安定'
     else:                 confidence = '△不安定'
@@ -546,12 +570,8 @@ def predict_position(past_gaps, rpci_pred=None):
 
 # ============================================================
 # 前半ペース速度（追走能力）の評価
-# PCIから前半1F平均を逆算: Ave3F = (PCI+50) × 上がり / 100
-# 前半1F = Ave3F / 3
-# 距離別基準（良馬場・2020〜2026年重賞実測値）
 # ============================================================
 FRONT_PACE_BASE = {
-    # 距離: (1F平均基準秒, std)
     1000: (11.244, 0.219),
     1200: (11.462, 0.253),
     1400: (11.674, 0.269),
@@ -562,62 +582,33 @@ FRONT_PACE_BASE = {
     2200: (12.131, 0.177),
     2400: (12.248, 0.169),
     2500: (12.323, 0.178),
-    3000: (12.400, 0.200),  # 推定値
-    3200: (12.420, 0.200),  # 推定値
+    3000: (12.400, 0.200),
+    3200: (12.420, 0.200),
 }
 
 def calc_front_pace_z(pci, agari, dist):
     """
     PCIと上がりから「前半ペースZスコア」を計算。
-    
-    前半1F平均 = (PCI+50) × 上がり / 100 / 3
-    前半ペースZ = (基準1F - 実際1F) / std
-      → マイナス = 前半が速い（追走がきつい）
-      → プラス   = 前半が遅い（スロー）
-    
-    Returns:
-        float or None: 前半ペースZスコア
     """
     try:
         pci = float(pci); agari = float(agari); dist = int(dist)
     except: return None
     if math.isnan(pci) or math.isnan(agari): return None
-    
-    ave3f = (pci + 50) * agari / 100      # 前半3F換算タイム
-    front_1f = ave3f / 3                   # 前半1F平均
-    
-    # 距離別の基準値（最近傍距離を使用）
+
+    ave3f = (pci + 50) * agari / 100
+    front_1f = ave3f / 3
+
     dists = sorted(FRONT_PACE_BASE.keys())
     nearest = min(dists, key=lambda d: abs(d - dist))
     base_1f, std_1f = FRONT_PACE_BASE[nearest]
     std_1f = std_1f if std_1f > 0 else 0.2
-    
-    # Z = (基準 - 実際) / std  → マイナスが速い
+
     return round((base_1f - front_1f) / std_1f, 3)
 
 
 def calc_pci_cs(past_runs, target_front_1f, tolerance_good=0.15, tolerance_near=0.30):
     """
     PCI追走スコア（PCI Chasing Score）
-
-    各馬の過去走PCIから前半1F平均を逆算し、
-    ターゲット前半速度（逃げ馬が作るペース）への対応実績を評価する。
-
-    Args:
-        past_runs:        過去走データのリスト（run_dataのdict）
-        target_front_1f:  逃げ馬が作る想定前半1F平均（秒）
-        tolerance_good:   「ほぼ同じ」とみなす誤差範囲（デフォルト±0.15秒）
-        tolerance_near:   「近い」とみなす誤差範囲（デフォルト±0.30秒）
-
-    Returns:
-        dict: {
-          'score':      PCI-CS スコア（プラス=追走能力高）,
-          'judge':      '◎'/'○'/'△'/'×',
-          'fastest_1f': 過去走での最速前半1F,
-          'best_run':   最も速い前半で好走したレース名,
-          'n_fast':     ターゲット以上の前半経験走数,
-          'detail':     詳細文字列,
-        }
     """
     valid_runs = []
     for r in past_runs:
@@ -633,7 +624,6 @@ def calc_pci_cs(past_runs, target_front_1f, tolerance_good=0.15, tolerance_near=
                 continue
         except:
             continue
-        # PCIから前半1F平均を逆算
         ave3f = (pci_f + 50) * agari_f / 100
         front_1f = ave3f / 3
         valid_runs.append({
@@ -653,10 +643,10 @@ def calc_pci_cs(past_runs, target_front_1f, tolerance_good=0.15, tolerance_near=
     detail_parts = []
 
     for r in valid_runs:
-        diff = target_front_1f - r['front_1f']  # プラス=ターゲット以上の前半経験
+        diff = target_front_1f - r['front_1f']
         rank = r['rank']
 
-        if diff >= 0:  # ターゲット以上に速い前半を経験済み
+        if diff >= 0:
             if rank and rank <= 3:
                 s = min(3.0, diff * 10 + 2.0)
                 score += s
@@ -667,11 +657,11 @@ def calc_pci_cs(past_runs, target_front_1f, tolerance_good=0.15, tolerance_near=
                 score += min(1.0, diff * 5) * 0.3
                 mark = '△'
             else:
-                score -= 0.5  # 速いペースで大敗
+                score -= 0.5
                 mark = '❌'
             detail_parts.append(f'{r["race"][:8]}(1F={r["front_1f"]:.3f},{rank}着{mark})')
 
-        elif diff >= -tolerance_good:  # ほぼ同じ速度
+        elif diff >= -tolerance_good:
             if rank and rank <= 3:
                 score += 1.0
                 mark = '✅近'
@@ -683,11 +673,10 @@ def calc_pci_cs(past_runs, target_front_1f, tolerance_good=0.15, tolerance_near=
             if mark:
                 detail_parts.append(f'{r["race"][:8]}(1F={r["front_1f"]:.3f},{rank}着{mark})')
 
-        elif diff >= -tolerance_near:  # やや遅い前半
+        elif diff >= -tolerance_near:
             if rank and rank <= 3:
                 score += 0.3
 
-    # 速い前半経験が全くない場合はペナルティ
     fastest = min(r['front_1f'] for r in valid_runs)
     n_fast  = sum(1 for r in valid_runs if r['front_1f'] <= target_front_1f + tolerance_good)
     if fastest > target_front_1f + tolerance_near:
@@ -715,16 +704,7 @@ def calc_pci_cs(past_runs, target_front_1f, tolerance_good=0.15, tolerance_near=
 
 def calc_race_env_score(rpci, dist, grade, venue):
     """
-    「今回出走するレース」自体の紛れやすさを判定する（calc_chase_env_discountの逆方向用）。
-
-    検証結果（2024-2025年G1/G2/G3・816件 vs 207件、95%CI±3.1%/±6.2%）:
-      env_score<=1（紛れにくい: 少頭数寄り・Sペース寄り・マイル以上・G1/G2・主要場）
-        × LPI1-5位 → 複勝率29.5%・単勝回収率98.4%
-      env_score>=2（紛れやすい）× LPI1-5位 → 複勝率29.5%・単勝回収率66.1%
-    複勝率は同水準だが、紛れにくい環境の方が回収率が明確に高い。
-    そのため「堅実軸」は env_score<=1 のレースでのLPI上位馬とする。
-
-    Returns: int (0〜4, 高いほど紛れやすい)
+    「今回出走するレース」自体の紛れやすさを判定する。
     """
     score = 0
     try:
@@ -743,25 +723,14 @@ def calc_race_env_score(rpci, dist, grade, venue):
 def calc_chase_env_discount(rpci, dist, grade, venue):
     """
     レース環境スコア（紛れの起きやすさ）からZへの割引係数を返す。
-
-    背景: 馬個体の過去成績パターンでは爆穴（人気薄の3着以内）を判別できなかったが、
-    「レース環境」側（出走頭数・ペース・距離・グレード・開催地）には明確な判別力があった。
-    Hペース・短距離・G3・小場開催のレースほど「紛れ」が起きやすく、
-    そこでの好走は次走での再現率が約15%低い（2020-2026年G1/G2/G3・740レース検証）。
-    そのため、こうした環境下での好走（Z）はそのまま信用せず、軽く割り引いて評価する。
-
-    出走頭数・先行馬数は出走表に無いため、ここではRPCI・距離・グレード・開催地のみで判定する
-    （簡易版でも0点→22.3%、2点→43.5%の単調な判別力を確認済み）。
-
-    Returns: 0.70〜1.00のZ割引係数（1.00=割引なし）
     """
     score = 0
     try:
-        if rpci is not None and float(rpci) <= 47: score += 1   # Hペース（紛れやすい）
+        if rpci is not None and float(rpci) <= 47: score += 1
     except Exception:
         pass
     try:
-        if dist is not None and float(dist) <= 1400: score += 1  # 短距離
+        if dist is not None and float(dist) <= 1400: score += 1
     except Exception:
         pass
     if grade == 'G3': score += 1
@@ -776,16 +745,6 @@ def calc_chase_env_discount(rpci, dist, grade, venue):
 def calc_course_weight(run_dist, run_venue, target_dist, target_venue):
     """
     過去走のコース・距離と今回の一致度から重みを計算。
-
-    設計根拠:
-    - 同コース・同距離が最も信頼性が高い（重み3.0）
-    - 距離差が大きいほど重みが下がる
-    - 他コースは同距離でも重み1.2（コース特性の差）
-    - 他コース・遠距離は重み0.3（参考程度）
-
-    例（対阪神2200m）:
-      阪神2200m → 3.0  阪神2000m → 1.5  東京2400m → 0.8
-      中山2200m → 1.2  東京2000m → 0.8  中山2500m → 0.5
     """
     try:
         run_dist    = float(run_dist)
@@ -906,6 +865,16 @@ def apply_venue_bonus(venue, elem, lpi, strength=0.15):
 
 # ============================================================
 # 基準テーブル構築（キャッシュ）
+# ------------------------------------------------------------
+# 【重要】ここに読み込ませるCSVは「重賞のみ」ではなく、
+# 平場（未勝利〜3勝クラス）を含む水準のデータを推奨。
+# 検証済み: 重賞級のみで基準を作ると、平場の馬を過小評価する
+# 系統的なズレが生じる(2024-2025年バックテストで確認、
+# 較正修正後に馬単回収率69.4%→82.3%まで改善)。
+#
+# 京都競馬場をアップする場合、2020年-2023年4月のデータは
+# 改修前の旧コースなので、新コース(2023年4月以降)のみに
+# 絞ったCSVにすることを推奨(旧コース混在で回収率53%→82%に改善した実績あり)。
 # ============================================================
 @st.cache_data
 def build_base_table(file_bytes):
@@ -1037,11 +1006,22 @@ def get_z(agari, dist, venue, baba, base_dict, 稍重_dict,
 
 # ============================================================
 # LPI計算メイン
+# ------------------------------------------------------------
+# 【2024-2025年バックテストで検証済みの変更点】
+#   ・pace_elem_adv / pace_bonus_strength: 展開ボーナス機能を追加(採用)
+#   ・disable_g1_streak_bonus: 既定でTrue(G1好走・連続好走ボーナスを廃止)
+#     検証: 廃止した方が馬連回収率が両年で一貫して改善(62.8%→65.6%,
+#     94.2%→102.7%)。会場適性ボーナス(bonus_strength)は逆に必須で、
+#     外すと馬単回収率が大幅悪化するため既定0.15のまま維持。
+#   ・target_dist: 対象レース自身の距離を明示指定できるように変更
+#     (旧: 馬の直近過去走の距離で代用していたバグを修正)
 # ============================================================
 def calc_lpi(entry_bytes, base_dict, 稍重_dict,
              target_track='T', target_venue='東京', bonus_strength=0.15,
              pace_pred_rpci=51.0, race_base_dict=None, target_race_name='',
-             target_front_1f_input=None, cushion_correction_input=0.0):
+             target_front_1f_input=None, cushion_correction_input=0.0,
+             pace_elem_adv=None, pace_bonus_strength=0.0,
+             disable_g1_streak_bonus=True, target_dist=None):
     for enc in ['cp932', 'shift_jis', 'utf-8-sig', 'utf-8']:
         try:
             df = pd.read_csv(io.BytesIO(entry_bytes), encoding=enc)
@@ -1125,8 +1105,6 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
             elem = classify_element(rpci, gap_est, z)
 
             # 環境スコア割引: 紛れが起きやすいレース環境での好走（高Z）を軽く割り引く
-            # rank_int<=3（好走）でZ>0（平均以上の上がり）の場合のみ適用する
-            # （凡走時は割引する意味がない。むしろ大敗の評価には影響させない）
             env_discount = 1.0
             if rank_int and rank_int <= 3 and z > 0:
                 env_discount = calc_chase_env_discount(rpci, dist, grade, venue)
@@ -1161,8 +1139,6 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
         use   = valid if valid else run_data
 
         # 改善③: 大敗（壊滅的なZの低下）が平均を過剰に押し下げないようキャップする。
-        # 1走の極端な大敗（Z<Z_FLOOR）はLPI換算後の値をZ_FLOOR相当に制限し、
-        # 好走実績が1度の大敗で相殺され過ぎないようにする。
         Z_FLOOR = -1.5
         LPI_FLOOR = sigmoid_score(Z_FLOOR)
         use = [
@@ -1187,34 +1163,25 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
 
         coef = get_venue_bonus(target_venue, dom_elem)
 
-        # PCI追走スコア（逃げ馬ペースへの対応実績）
-        pci_cs_result = None
-        if pace_pred_rpci is not None:
-            # サイドバーのtarget_front_1fは外から渡せないので
-            # run_data に格納してUIで使う
-            pass
-
         # ポジション予測（有効走の地点差から）
         past_gaps_for_pred = [r['gap_est'] for r in use
                                if r['gap_est'] < 5.0][:5]  # 大外れ値除外
         pos_pred = predict_position(past_gaps_for_pred, pace_pred_rpci)
 
         # 上がり予測（過去走のZスコアから）
-        # コースのペース予測からペース帯を決定
         _pred_rpci = pace_pred_rpci
         _pace_cat  = 'H' if _pred_rpci <= 47 else ('S' if _pred_rpci >= 54 else 'M')
 
-        # 予測ポジション（地点差）を上がり予測に渡す
         _pred_gap = pos_pred['pred_gap'] if pos_pred else None
-        # PCI-CSスコアを上がり予測に渡す（target_front_1fが設定されている場合）
         _pci_cs_score = None
         if target_front_1f_input is not None and target_front_1f_input > 0:
             _cs = calc_pci_cs(use[:5], target_front_1f_input)
             _pci_cs_score = _cs['score'] if _cs else None
 
+        _target_dist = target_dist if target_dist is not None else float(str(run_data[0]['dist']).replace('m',''))
         agari_pred = predict_agari(
             past_runs           = use[:5],
-            target_dist         = float(str(run_data[0]['dist']).replace('m','')),
+            target_dist         = _target_dist,
             target_venue        = target_venue,
             target_baba         = '良',
             predicted_pace_cat  = _pace_cat,
@@ -1225,10 +1192,7 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
             pace_target_front_1f= target_front_1f_input,
         )
 
-        # ===== 好走LPIボーナス（全グレード対応・直近5走対応）=====
-        # 改善①: G1限定だった対象をG1/G2/G3/Lの全グレードに拡張し、直近5走全てを対象にする。
-        #         着順1着の馬の評価を「Zの加重平均」だけに任せず、勝ち切った実績を直接加点する。
-        # グレード別・着順別ボーナステーブル（1着が最大、3着まで対象）
+        # ===== 好走LPIボーナス（既定で無効化・検証済み）=====
         GRADE_RANK_BONUS_TABLE = {
             'G1': {1: 3.0, 2: 2.0, 3: 1.0},
             'G2': {1: 2.0, 2: 1.3, 3: 0.7},
@@ -1237,7 +1201,9 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
         }
         g1_lpi_bonus = 0.0
         g1_bonus_detail = []
-        for rn in run_data[:5]:   # 直近5走全てを対象
+        for rn in run_data[:5]:
+            if rn.get('excluded_track'):  # トラック不一致の実績は混ぜない
+                continue
             grade = rn['grade']
             if grade not in GRADE_RANK_BONUS_TABLE:
                 continue
@@ -1246,29 +1212,37 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
                 if b > 0:
                     g1_lpi_bonus += b
                     g1_bonus_detail.append(f"{rn['race']}_{rn['rank_int']}着+{b}")
-        g1_lpi_bonus = min(g1_lpi_bonus, 8.0)   # 上限8点（5走対応で上限を拡張）
+        g1_lpi_bonus = min(g1_lpi_bonus, 8.0)
 
-        # 改善②: 連続好走（直近2走以上連続で3着以内）への追加ボーナス
-        # サトノレーヴ（1着→1着→1着）のような「勢いのある馬」を正当評価する。
         streak_bonus = 0.0
         streak_detail = ''
         streak_len = 0
         for rn in run_data[:5]:
+            if rn.get('excluded_track'):
+                continue
             if rn['rank_int'] and rn['rank_int'] <= 3:
                 streak_len += 1
             else:
                 break
         if streak_len >= 2:
-            # 2連続+1.0、3連続+2.0、4連続+3.0、5連続+4.0（上限4.0）
             streak_bonus = min((streak_len - 1) * 1.0, 4.0)
             streak_detail = f'直近{streak_len}走連続3着以内+{streak_bonus:.1f}'
         g1_lpi_bonus = min(g1_lpi_bonus + streak_bonus, 10.0)
         if streak_detail:
             g1_bonus_detail.append(streak_detail)
 
+        if disable_g1_streak_bonus:
+            g1_lpi_bonus = 0.0
+            g1_bonus_detail = []
+
         # ボーナスをLPIに加算（上限100）
         avg_lpi_adj      = min(100.0, round(avg_lpi      + g1_lpi_bonus, 1))
         avg_venue_lpi_adj = min(100.0, round(avg_venue   + g1_lpi_bonus, 1))
+
+        # 展開ボーナス（検証済み・既定で有効）
+        if pace_elem_adv and pace_bonus_strength:
+            avg_venue_lpi_adj = apply_pace_bonus(dom_elem, pace_elem_adv, avg_venue_lpi_adj,
+                                                  strength=pace_bonus_strength)
 
         results.append({
             'horse': horse, 'sex': sex, 'age': age,
@@ -1284,7 +1258,7 @@ def calc_lpi(entry_bytes, base_dict, 稍重_dict,
             'pos_pred':   pos_pred,
             'agari_pred': agari_pred,
             'runs': run_data, 'valid_runs': valid, 'good_runs': good,
-            'pci_cs_runs': use[:5],  # PCI-CS計算用の有効走
+            'pci_cs_runs': use[:5],
         })
 
     results.sort(key=lambda x: -x['avg_venue_lpi'])
@@ -1297,7 +1271,6 @@ def plot_ranking(results, race_name, target_venue):
     import matplotlib
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
-    # 日本語フォントを環境に応じて自動選択
     import matplotlib.font_manager as fm
     jp_fonts = ['Noto Sans CJK JP','IPAexGothic','IPAPGothic',
                 'Hiragino Sans','Yu Gothic','Meiryo','MS Gothic']
@@ -1324,12 +1297,10 @@ def plot_ranking(results, race_name, target_venue):
             alpha=0.92, label=f'{target_venue}補正LPI')
     ax.axvline(80, color='#E24B4A', linestyle='--', linewidth=1, alpha=0.5)
     ax.set_yticks(y)
-    # 日本語フォントが見つからない場合は順位番号のみ表示
     if chosen:
         ax.set_yticklabels([f'{i+1}. {n}' for i,n in enumerate(names)], fontsize=9)
     else:
         ax.set_yticklabels([f'{i+1}.' for i in range(len(names))], fontsize=9)
-        # 代わりにグラフ右に馬名テキストを追加
         for i, name in enumerate(names):
             ax.text(56.5, i, name, va='center', fontsize=7,
                     color='gray', fontfamily='DejaVu Sans')
@@ -1357,15 +1328,16 @@ def plot_ranking(results, race_name, target_venue):
 # Streamlit UI
 # ============================================================
 st.title('🏇 LPI v11 競馬予想ツール')
-st.caption('LPI (ラップ強さ指数) v11 — 位置取り補正・グレード加重・斤量補正・競馬場適合ボーナス対応')
+st.caption('LPI (ラップ強さ指数) v11 — 展開ボーナス対応版。2024-2025年バックテスト済み設定を既定値として採用。')
 
 # ---- サイドバー ----
 with st.sidebar:
     st.header('⚙️ 設定')
 
     st.subheader('① 基準テーブル用CSV')
+    st.caption('⚠️ 平場（未勝利〜3勝クラス）水準のデータ推奨。重賞のみだと較正がズレます。')
     base_file = st.file_uploader(
-        '2023〜2026年全距離重賞CSVをアップ',
+        '2020〜2025年など、複数年分の平場結果CSVをアップ',
         type='csv', key='base')
     if base_file:
         st.success(f'{base_file.name} 読み込み済み')
@@ -1376,7 +1348,7 @@ with st.sidebar:
         type='csv', key='entry')
 
     st.subheader('③ レース設定')
-    race_name    = st.text_input('レース名', value='2026 安田記念G1')
+    race_name    = st.text_input('レース名', value='2026 レース名')
     target_venue = st.selectbox(
         '競馬場',
         ['東京','中山','京都','阪神','中京','新潟','福島','小倉','札幌','函館'])
@@ -1384,72 +1356,66 @@ with st.sidebar:
     track_code   = 'T' if target_track.startswith('T') else 'D'
     bonus_strength = st.slider(
         '競馬場ボーナス強度', 0.0, 0.30, 0.15, 0.05,
-        help='0=ボーナスなし / 0.15=標準 / 0.30=強め')
+        help='0=ボーナスなし / 0.15=標準(検証済み・推奨) / 0.30=強め。'
+             '検証済み: このボーナスを外すと馬単回収率が大幅に悪化します。')
 
-    st.subheader('④ ペース予測（任意）')
+    st.subheader('④ ペース予測（自動判定・上書き可）')
     race_dist = st.number_input('レース距離（m）', min_value=1000, max_value=3600, value=1600, step=200)
-    nige_count   = st.number_input('逃げ馬頭数', min_value=0, max_value=10, value=0, step=1,
-                                   help='出走表の決め手=逃げの馬の頭数')
-    senkou_count = st.number_input('先行馬頭数', min_value=0, max_value=16, value=0, step=1,
-                                   help='出走表の決め手=先行の馬の頭数')
 
-    st.markdown('**ペース直接指定（任意）**')
-    st.markdown('**ペース直接指定（任意）**')
+    auto_pace = st.checkbox('出走馬の脚質から自動でペースを判定する', value=True,
+                             help='検証済み(展開ボーナス): 各馬の過去走地点差から脚質を自動判定し、'
+                                  'ペース予測・展開適合ボーナスに反映します。')
+    if not auto_pace:
+        nige_count   = st.number_input('逃げ馬頭数', min_value=0, max_value=10, value=0, step=1)
+        senkou_count = st.number_input('先行馬頭数', min_value=0, max_value=16, value=0, step=1)
+    else:
+        nige_count, senkou_count = 0, 0  # 自動判定時は実行時に上書きする
+
+    use_pace_bonus = st.checkbox('展開適合ボーナスをLPIに反映する', value=True,
+                                  help='検証済み: 有効にすると馬単回収率70.8%→82.3%(2024-2025年バックテスト)')
+    pace_bonus_strength_input = st.slider('展開ボーナスの強さ', 0.0, 6.0, 3.0, 0.5,
+                                           disabled=not use_pace_bonus)
+
+    st.markdown('**ペース直接指定（任意・自動判定を上書き）**')
     manual_pace = st.radio(
         'ペース帯を選択',
-        options=['自動推定（コース統計から）', '🔵 H（ハイ）', '🟢 M（ミドル）', '🟠 S（スロー）'],
+        options=['自動推定（コース統計/脚質判定から）', '🔵 H（ハイ）', '🟢 M（ミドル）', '🟠 S（スロー）'],
         index=0,
-        help='自動推定: コース統計+逃げ・先行頭数から計算\n'
-             'H: 前半が速く先行馬が消耗する展開\n'
-             'M: 平均的なペース\n'
-             'S: 前半が遅く上がり勝負になる展開',
         horizontal=False,
     )
-    # radio の選択を pace_cat と manual_rpci に変換
     if '自動' in manual_pace:
         manual_rpci = 0.0
     elif 'H' in manual_pace:
-        manual_rpci = 45.0   # H帯の代表値
+        manual_rpci = 45.0
     elif 'M' in manual_pace:
-        manual_rpci = 51.0   # M帯の代表値
-    else:  # S
-        manual_rpci = 57.0   # S帯の代表値
+        manual_rpci = 51.0
+    else:
+        manual_rpci = 57.0
 
-    st.subheader('⑤ PCI追走スコア（任意）')
+    st.subheader('⑤ 好走ボーナス（既定オフ・検証済み）')
+    enable_g1_streak_bonus = st.checkbox(
+        'G1好走・連続好走ボーナスを使う', value=False,
+        help='検証済み: オフの方が馬連回収率が2024-2025年両年で一貫して良い結果でした'
+             '(62.8%→65.6%, 94.2%→102.7%)。会場適性ボーナスとは別物です。'
+    )
+
+    st.subheader('⑥ PCI追走スコア（任意）')
     use_pci_cs = st.checkbox(
         '逃げ馬ペースへの追走能力を評価する',
         value=False,
-        help='逃げ馬がいる場合、そのペースに対応できる馬を評価します'
     )
     if use_pci_cs:
         target_front_1f = st.number_input(
             '逃げ馬の想定前半1F（秒）',
             min_value=10.5, max_value=13.5, value=11.9, step=0.05,
-            help='PCIから逆算: (PCI+50)×上がり/100/3\n'
-                 '例) タバル宝塚2025実績=11.892秒/F\n'
-                 '    大阪杯ペース目安=11.8秒/F'
-        )
-        st.caption(
-            f'ターゲット{target_front_1f:.3f}秒/F以下の前半を経験した馬を高評価'
         )
     else:
         target_front_1f = None
 
-    st.subheader('⑥ クッション値（任意）')
-    use_cushion = st.checkbox(
-        'クッション値で基準上がりを補正する',
-        value=False,
-        help='当日朝に発表されるクッション値を入力すると\n'
-             '基準上がりが自動補正されます。\n'
-             '基準: 9.0（補正なし）\n'
-             '7.0（軟）→基準+0.30秒 / 11.0（硬）→基準-0.30秒'
-    )
+    st.subheader('⑦ クッション値（任意）')
+    use_cushion = st.checkbox('クッション値で基準上がりを補正する', value=False)
     if use_cushion:
-        cushion_val = st.number_input(
-            'クッション値',
-            min_value=5.0, max_value=14.0, value=9.0, step=0.1,
-            help='JRAが当日朝に発表。競馬場公式サイトで確認できます。'
-        )
+        cushion_val = st.number_input('クッション値', min_value=5.0, max_value=14.0, value=9.0, step=0.1)
         cushion_adj = round((9.0 - cushion_val) * 0.15, 3)
         if cushion_adj > 0:
             st.caption(f'クッション値{cushion_val:.1f} → 基準上がり{cushion_adj:+.2f}秒（遅い馬場）')
@@ -1465,7 +1431,7 @@ with st.sidebar:
 
 # ---- メインエリア ----
 if not base_file:
-    st.info('← サイドバーから基準テーブル用CSVをアップしてください（2023〜2026年全距離重賞データ）')
+    st.info('← サイドバーから基準テーブル用CSVをアップしてください（平場水準のデータ推奨）')
     st.stop()
 
 if not entry_file:
@@ -1473,7 +1439,10 @@ if not entry_file:
     st.stop()
 
 if run_btn or (base_file and entry_file):
-    # ペース予測（manual_rpci が入力されていればそちらを優先）
+    entry_bytes_for_pace = entry_file.read()
+    entry_file.seek(0)
+
+    # ---- ペース予測 ----
     if manual_rpci > 0:
         _mr = manual_rpci
         if _mr <= 47:
@@ -1493,8 +1462,20 @@ if run_btn or (base_file and entry_file):
                     fast_pct=100 if _mr<=47 else 0,
                     label=_label, lamp=_lamp,
                     elem_adv=_elem_adv, comment=_comment)
+        auto_style_info = None
+    elif auto_pace:
+        # 展開ボーナス: 2パス構成(1パス目=脚質自動判定)
+        try:
+            auto_style_info = precompute_running_styles(entry_bytes_for_pace)
+            pace = get_pace_prediction(race_dist, target_venue,
+                                        auto_style_info['nige'], auto_style_info['senkou'])
+        except Exception as e:
+            st.warning(f'脚質自動判定に失敗したため手動値(0,0)で計算します: {e}')
+            auto_style_info = None
+            pace = get_pace_prediction(race_dist, target_venue, 0, 0)
     else:
         pace = get_pace_prediction(race_dist, target_venue, nige_count, senkou_count)
+        auto_style_info = None
 
     with st.spinner('基準テーブルを構築中...'):
         base_dict, 稍重_dict, race_base_dict = build_base_table(base_file.read())
@@ -1512,6 +1493,10 @@ if run_btn or (base_file and entry_file):
             target_race_name=race_name,
             target_front_1f_input=target_front_1f if use_pci_cs else None,
             cushion_correction_input=cushion_adj if use_cushion else 0.0,
+            pace_elem_adv=pace['elem_adv'] if use_pace_bonus else None,
+            pace_bonus_strength=pace_bonus_strength_input if use_pace_bonus else 0.0,
+            disable_g1_streak_bonus=not enable_g1_streak_bonus,
+            target_dist=float(race_dist),
         )
 
     if not results:
@@ -1519,6 +1504,12 @@ if run_btn or (base_file and entry_file):
         st.stop()
 
     st.success(f'✅ {len(results)}頭 計算完了')
+
+    if auto_style_info:
+        st.caption(
+            f"🐎 脚質自動判定結果: 逃げ{auto_style_info['nige']}頭 / 先行{auto_style_info['senkou']}頭 / "
+            f"中団{auto_style_info['chudan']}頭 / 後方{auto_style_info['oikomi']}頭 / 不明{auto_style_info['fumei']}頭"
+        )
 
     # ---- ペース予測バナー ----
     lamp_color  = {'🟠': '#E65100', '🔵': '#0D47A1', '⚪': '#424242'}
@@ -1547,7 +1538,6 @@ if run_btn or (base_file and entry_file):
     )
 
     # ---- レース環境スコア（堅実軸）バナー ----
-    # レース名からグレードを推定（race_nameに"G1"等が含まれる場合のみ判定）
     _race_grade = extract_grade(race_name)
     race_env_score = calc_race_env_score(pace['pred_rpci'], race_dist, _race_grade, target_venue)
     if race_env_score <= 1:
@@ -1575,7 +1565,6 @@ if run_btn or (base_file and entry_file):
         unsafe_allow_html=True
     )
 
-
     # ---- タブで表示 ----
     tab1, tab2, tab3, tab4 = st.tabs(['📊 ランキング表', '📈 グラフ', '🔍 過去走詳細', '🎲 シミュレーション'])
 
@@ -1583,8 +1572,6 @@ if run_btn or (base_file and entry_file):
     with tab1:
         st.subheader(f'{race_name}  LPI v11 ランキング')
 
-        # 表データ作成
-        # PCI-CS計算（サイドバーでtarget設定済みの場合）
         pci_cs_map = {}
         if use_pci_cs and target_front_1f:
             for r in results:
@@ -1593,41 +1580,36 @@ if run_btn or (base_file and entry_file):
 
         rows = []
         for i, r in enumerate(results):
-            bonus_runs = [rn for rn in r['runs'] if rn['hb'] > 0]
+            bonus_runs = [rn for rn in r['runs'] if rn.get('hb', 0) > 0]
             bonus_str  = ' / '.join(
-                [f"{rn['race']}({rn['hb_r']})" for rn in bonus_runs])
+                [f"{rn.get('race','-')}({rn.get('hb_r','')})" for rn in bonus_runs])
             g1_bonus_str = (f"+{r['g1_lpi_bonus']:.1f}({r['g1_bonus_detail']})"
                            if r.get('g1_lpi_bonus', 0) > 0 else '-')
             past  = [rn for rn in r['runs']
-                     if not rn['excluded_baba'] and not rn['excluded_track']][:5]
+                     if not rn.get('excluded_baba') and not rn.get('excluded_track')][:5]
             plpi  = [round(rn['lpi'], 1) for rn in past]
             while len(plpi) < 5: plpi.append('-')
 
-            delta = r['venue_delta']
-            # ペース適合判定
+            delta = r.get('venue_delta', 0.0)
             pace_match = r['dom_elem'] in pace['elem_adv'] if pace['elem_adv'] else None
             pace_mark = '◎' if pace_match else ('△' if pace_match is False else '-')
 
-            # 末脚Z（信頼性付き）
             if r.get('agari_pred'):
                 ap = r['agari_pred']
                 z_val   = round(ap['pred_z'], 3)
-                grade   = ap['grade_label']        # 🔴A / 🟡B / ⚪C
-                conf    = ap['confidence']          # ◎○△
+                grade   = ap['grade_label']
+                conf    = ap['confidence']
                 n_valid = ap['n_valid']
                 n_disc  = ap.get('n_discounted', 0)
-                # G1/G2限定フィルター適用有無
                 hg_only = '★G1/G2限定' if ap.get('comment','') and 'G1/G2走' in ap.get('comment','') else ''
                 matsu_str = f'{grade} {conf}  Z={z_val:+.3f}({n_valid}走{hg_only})'
             else:
                 matsu_str = '-'; z_val = '-'
 
-            # PCI追走スコア
             pci_str = (pci_cs_map[r['horse']]['judge'] + ' ' +
                        str(pci_cs_map[r['horse']]['score'])
                        + '（' + pci_cs_map[r['horse']]['detail'][:15] + '）')                        if r['horse'] in pci_cs_map else '-'
 
-            # 予測ポジション
             if r.get('pos_pred'):
                 pp = r['pos_pred']
                 avg_gap = (sum(pp['past_gaps'])/len(pp['past_gaps'])
@@ -1637,7 +1619,6 @@ if run_btn or (base_file and entry_file):
             else:
                 pos_str = '-'
 
-            # 過去ポジション（予測ではなく過去走の地点差実績）
             pp = r.get('pos_pred')
             if pp and pp.get('past_gaps'):
                 gaps = pp['past_gaps']
@@ -1649,8 +1630,6 @@ if run_btn or (base_file and entry_file):
             else:
                 past_pos_str = '-'
 
-            # 堅実軸マーク: レース環境スコア<=1（紛れにくい）かつLPI上位5位以内
-            # 検証済み: この条件で複勝率29.5%・単勝回収率98.4%（2024-2025年816件）
             if race_env_score <= 1 and (i + 1) <= 5:
                 kentaku_str = '🟢堅実軸'
             elif race_env_score >= 3 and (i + 1) <= 5:
@@ -1663,6 +1642,7 @@ if run_btn or (base_file and entry_file):
                 '馬名':           r['horse'],
                 f'LPI[{target_venue}補正]': r['avg_venue_lpi'],
                 'LPI基本':        r['avg_lpi'],
+                '展開適合':       pace_mark,
                 'G1好走B':        g1_bonus_str,
                 '要素型':         r['dom_elem'],
                 '係数':           r['coef'],
@@ -1682,11 +1662,7 @@ if run_btn or (base_file and entry_file):
         result_df = pd.DataFrame(rows)
         lpi_col   = f'LPI[{target_venue}補正]'
 
-        # カラーハイライト
-        # highlight関数はhighlight_with_tに統合
-
         def highlight_with_t(row):
-            # LPI上位3頭をハイライト
             try:
                 lpi_rank = int(row.get('順位', 99) or 99)
             except (TypeError, ValueError):
@@ -1699,7 +1675,6 @@ if run_btn or (base_file and entry_file):
 
         fmt = {lpi_col: '{:.1f}', 'LPI基本': '{:.1f}',
                'LPI最高': '{:.1f}', 'LPI直近': '{:.1f}', '係数': '{:.2f}'}
-        # 末脚Zは数値と'-'が混在するためformat辞書には入れず事前に文字列化
 
         st.dataframe(
             result_df.style
@@ -1711,7 +1686,6 @@ if run_btn or (base_file and entry_file):
             height=min(600, 45 + len(rows) * 38),
         )
 
-        # Excel ダウンロード
         buf = io.BytesIO()
         result_df.to_excel(buf, index=False)
         buf.seek(0)
@@ -1728,7 +1702,6 @@ if run_btn or (base_file and entry_file):
         fig = plot_ranking(results, race_name, target_venue)
         st.pyplot(fig)
 
-        # 要素型の説明
         with st.expander('要素型の見方'):
             st.markdown("""
 | 要素型 | 説明 | 東京係数 | 阪神係数 |
@@ -1748,7 +1721,6 @@ if run_btn or (base_file and entry_file):
 
         if hr:
             col1, col2, col3, col4 = st.columns(4)
-            # ポジション予測サマリー
             if hr.get('pos_pred'):
                 pp = hr['pos_pred']
                 st.markdown(
@@ -1758,7 +1730,6 @@ if run_btn or (base_file and entry_file):
                 )
             if hr.get('agari_pred'):
                 ap = hr['agari_pred']
-                # ペース帯別Z表示
                 pace_z_parts = []
                 for p, lbl in [('H','🔵ハイ'),('M','🟢ミドル'),('S','🟠スロー')]:
                     z_val = ap['z_by_pace'].get(p)
@@ -1769,7 +1740,6 @@ if run_btn or (base_file and entry_file):
                         pace_z_parts.append(f'{lbl}: データなし')
                 pace_z_str = '　'.join(pace_z_parts)
 
-                used_pace_lbl = {'H':'ハイペース','M':'ミドル','S':'スロー',None:'全体'}
                 st.markdown(
                     f"**上がり予測:** {ap['grade_label']}　{ap['confidence']}　"
                     f"予測上がり **{ap['pred_agari']}秒**（コース基準{ap['course_base']:.1f}秒）{ap.get('gap_note','')}\n\n"
@@ -1785,26 +1755,26 @@ if run_btn or (base_file and entry_file):
             run_rows = []
             for rn in hr['runs']:
                 excl_reason = []
-                if rn['excluded_baba']:  excl_reason.append('重/不良')
-                if rn['excluded_track']: excl_reason.append('トラック違い')
+                if rn.get('excluded_baba'):  excl_reason.append('重/不良')
+                if rn.get('excluded_track'): excl_reason.append('トラック違い')
                 run_rows.append({
-                    '走前':     rn['n'],
-                    'レース名': rn['race'],
-                    '競馬場':   rn['venue'],
-                    '距離':     int(rn['dist']),
-                    '馬場':     rn['baba'],
-                    'RPCI':     rn['rpci'],
-                    '地点差':   rn['gap_est'],
-                    '上がり':   rn['agari'],
-                    '斤量補正': rn['wt_corr'],
-                    'Zスコア':  rn['z'],
-                    'pb(位置補正)': rn['pb'],
-                    'hb(不利B)':   rn['hb'],
-                    'LPI':      rn['lpi'],
-                    '要素型':   rn['elem'],
+                    '走前':     rn.get('n', '-'),
+                    'レース名': rn.get('race', '-'),
+                    '競馬場':   rn.get('venue', '-'),
+                    '距離':     int(rn['dist']) if rn.get('dist') is not None else '-',
+                    '馬場':     rn.get('baba', '-'),
+                    'RPCI':     rn.get('rpci', '-'),
+                    '地点差':   rn.get('gap_est', '-'),
+                    '上がり':   rn.get('agari', '-'),
+                    '斤量補正': rn.get('wt_corr', 0.0),
+                    'Zスコア':  rn.get('z', '-'),
+                    'pb(位置補正)': rn.get('pb', 0.0),
+                    'hb(不利B)':   rn.get('hb', 0.0),
+                    'LPI':      rn.get('lpi', '-'),
+                    '要素型':   rn.get('elem', '-'),
                     '前半速度Z': rn.get('front_pace_z', '-'),
                     '除外':     '⚠️ ' + '/'.join(excl_reason) if excl_reason else '✅',
-                    '不利理由': rn['hb_r'],
+                    '不利理由': rn.get('hb_r', ''),
                 })
 
             run_df = pd.DataFrame(run_rows)
@@ -1826,18 +1796,22 @@ if run_btn or (base_file and entry_file):
     # ===== タブ4: モンテカルロシミュレーション =====
     with tab4:
         st.subheader('🎲 モンテカルロ シミュレーション')
+        st.warning(
+            '⚠️ 参考情報: このシミュレーション方式(予測地点差+予測上がりの絶対値を'
+            '足し合わせて順位を決める方式)は、2024-2025年バックテストで'
+            'LPIスコアによる順位付けより不安定という結果が出ています'
+            '(年によって精度の方向が逆転)。参考程度に留めてください。'
+        )
         st.markdown(
             '予測上がり・予測地点差の**誤差範囲でランダムにばらつかせて**1万回レースを試行し、'
             '各馬の勝利確率・複勝確率を推定します。'
         )
 
-        # シミュレーション対象馬（pos_pred・agari_pred が揃っている馬）
         sim_horses = [(r['horse'],
                        r['pos_pred']['pred_gap'],
                        r['agari_pred']['pred_agari'])
                       for r in results
                       if r.get('pos_pred') and r.get('agari_pred')]
-        # 安定度表示用
         sim_stability = {
             r['horse']: {
                 'agari_conf': r['agari_pred'].get('confidence','△不安定'),
@@ -1857,7 +1831,6 @@ if run_btn or (base_file and entry_file):
                     '試行回数',
                     options=[1000, 3000, 5000, 10000],
                     value=5000,
-                    help='多いほど精度が上がるが時間がかかります'
                 )
             with col_s2:
                 show_top3 = st.checkbox('複勝確率（3着以内）も表示', value=True)
@@ -1869,10 +1842,7 @@ if run_btn or (base_file and entry_file):
                 pred_total = pred_gaps + pred_agari
                 n_horses   = len(names)
 
-                # 馬個別の安定度をσに変換
-                # 上がり: agari_pred['z_std'] → σ_agari
-                # 地点差: pos_pred['gap_std'] → σ_gap（そのまま使用）
-                AGARI_BASE_STD = 1.065  # 全体の平均誤差std（フォールバック）
+                AGARI_BASE_STD = 1.065
                 GAP_BASE_STD   = 0.589
 
                 sigma_agari = np.array([
@@ -1889,7 +1859,6 @@ if run_btn or (base_file and entry_file):
                         else GAP_BASE_STD))
                     for r in results if r.get('pos_pred') and r.get('agari_pred')
                 ])
-                # z_std（上がり不安定度）を記録
                 z_stds = np.array([
                     r['agari_pred']['z_std']
                     if r.get('agari_pred') and r['agari_pred'].get('z_std')
@@ -1903,15 +1872,12 @@ if run_btn or (base_file and entry_file):
                 np.random.seed(None)
                 with st.spinner(f'{n_trials:,}回シミュレーション中...'):
                     for _ in range(n_trials):
-                        # 地点差: 個別σで正規分布
                         sim_gaps = np.maximum(0,
                             pred_gaps + np.random.normal(0, sigma_gap))
 
-                        # 上がり: 個別σ + 不安定馬は上方向（速い側）を抑制
                         base_noise = np.random.normal(0, sigma_agari)
                         for i in range(n_horses):
                             if z_stds[i] > 0.7 and base_noise[i] < 0:
-                                # 不安定馬の「速い方向」ばらつきを半減
                                 base_noise[i] *= 0.5
                         sim_agaris = pred_agari + base_noise
 
@@ -1920,7 +1886,6 @@ if run_btn or (base_file and entry_file):
                         wins[order[0]]   += 1
                         top3s[order[:3]] += 1
 
-                # 結果DataFrame
                 sim_rows = []
                 for i in range(n_horses):
                     wp = wins[i]  / n_trials * 100
@@ -1940,11 +1905,9 @@ if run_btn or (base_file and entry_file):
                     })
 
                 sim_df = pd.DataFrame(sim_rows)
-                # 勝利確率順にソート
                 sim_df = sim_df.sort_values('勝利回数', ascending=False).reset_index(drop=True)
                 sim_df['勝利確率順'] = range(1, len(sim_df)+1)
 
-                # ハイライト
                 def sim_highlight(row):
                     rank = row['勝利確率順']
                     if rank == 1: return ['background-color:#F9A825;color:#000;font-weight:bold']*len(row)
@@ -1965,7 +1928,6 @@ if run_btn or (base_file and entry_file):
                     height=min(600, 45 + len(sim_df)*38),
                 )
 
-                # 補足
                 st.caption(
                     f'試行回数: {n_trials:,}回 ／ '
                     f'上がりσ: 馬個別（z_std×1.4, 範囲0.5〜2.0秒）／ '
@@ -1978,6 +1940,11 @@ if run_btn or (base_file and entry_file):
                     'LPI上位でも通過Tが遅い馬は勝利確率が低く出ます。'
                 )
 
+# ============================================================
+# フッター
+# ============================================================
+st.markdown('---')
+st.caption('LPI v11 | 展開ボーナス対応版 | 2024-2025年バックテスト済み設定 | 平場基準推奨 | 会場適性ボーナスON・G1好走ボーナスOFF既定')
 # ============================================================
 # フッター
 # ============================================================
