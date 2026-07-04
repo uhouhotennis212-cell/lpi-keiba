@@ -888,7 +888,7 @@ def build_base_table(file_bytes):
     else:
         raise ValueError('CSVの文字コードを判定できませんでした')
 
-    df['距離_num'] = df['距離'].str.extract(r'(\d+)').astype(float)
+    df['距離_num'] = df['距離'].astype(str).str.extract(r'(\d+)').astype(float)
     df['上がり']   = pd.to_numeric(df['上り3F'], errors='coerce')
     df['競馬場']   = df['開催'].apply(get_venue_from_kaisan)
     df['馬場']     = df['馬場状態'].str.strip()
