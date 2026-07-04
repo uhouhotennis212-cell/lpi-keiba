@@ -891,7 +891,7 @@ def build_base_table(file_bytes):
     df['距離_num'] = df['距離'].astype(str).str.extract(r'(\d+)').astype(float)
     df['上がり']   = pd.to_numeric(df['上り3F'], errors='coerce')
     df['競馬場']   = df['開催'].apply(get_venue_from_kaisan)
-    df['馬場']     = df['馬場状態'].str.strip()
+    df['馬場']  = df['馬場状態'].astype(str).str.strip()
     df['日付_num'] = pd.to_numeric(df['日付'], errors='coerce')
     df['年']       = (df['日付_num'] // 10000).fillna(0).astype(int)
     df['レース名_s'] = df['レース名'].str.strip() if 'レース名' in df.columns else ''
