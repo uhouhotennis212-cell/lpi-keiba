@@ -1499,10 +1499,17 @@ CLASS_1PLUS = {'1勝クラス', '2勝クラス', '3勝クラス', 'L', 'オー�
 
 def passes_race_filter(dist, n_horses, venue, race_class,
                         min_horses=11, max_dist=1400,
-                        exclude_venues=('東京',), allowed_classes=CLASS_1PLUS):
+                        exclude_venues=('東京',), allowed_classes=CLASS_1PLUS,
+                        odds_product=None, odds_lo=40, odds_hi=120, require_odds=False):
     """
-    検証済みの複合フィルター。4条件すべてを満たすレースだけTrueを返す。
+    検証済みの複合フィルター。5条件すべてを満たすレースだけTrueを返す。
     厳選対象の「候補プール」を絞り込むために使う(軸・相手の選び方自体は変えない)。
+
+    odds_product: 軸(LPI1位)と相手1位(LPI2位)の単勝オッズの積。
+        検証済み(2020-2026年重賞データ・全馬総当たり): オッズ積40〜120が
+        馬連回収率の「お得ゾーン」。オッズ積が分かる場合のみこの条件を追加適用する。
+        当日オッズが未入力(odds_product=None)の場合、require_odds=Falseなら
+        このフィルターはスキップする(従来の4条件のみで判定)。
     """
     if n_horses < min_horses:
         return False
@@ -1512,28 +1519,47 @@ def passes_race_filter(dist, n_horses, venue, race_class,
         return False
     if race_class not in allowed_classes:
         return False
+    if odds_product is not None:
+        if not (odds_lo <= odds_product <= odds_hi):
+            return False
+    elif require_odds:
+        return False
     return True
 
 
 def select_top_gap_races(race_lpi_results, n_select=3, use_race_filter=True,
                           min_horses=11, max_dist=1400,
-                          exclude_venues=('東京',), allowed_classes=CLASS_1PLUS):
+                          exclude_venues=('東京',), allowed_classes=CLASS_1PLUS,
+                          odds_map=None, odds_lo=40, odds_hi=120, require_odds=False):
     """
     各レースのLPI計算結果から、LPI1位と2位のスコア差(gap)が大きい順にn_select件を選ぶ。
     use_race_filter=True(既定)の場合、検証済みの複合フィルター
-    (頭数11以上・距離1400m以下・東京以外・1勝クラス以上)を先にかけてから選定する。
+    (頭数11以上・距離1400m以下・東京以外・1勝クラス以上・[任意]軸×相手のオッズ積40-120)
+    を先にかけてから選定する。
+
+    odds_map: {馬名: 単勝オッズ} の辞書。渡された場合、軸(LPI1位)と相手1位(LPI2位)の
+        オッズ積が40〜120の範囲内かどうかも判定に加える(検証済みの「お得ゾーン」)。
+        require_odds=Trueの場合、オッズが不明な馬は候補から除外する。
     """
     scored = []
     for r in race_lpi_results:
         ranked = r['ranked']
         if len(ranked) < 2:
             continue
+        odds_product = None
+        if odds_map is not None:
+            o1 = odds_map.get(ranked[0]['horse'])
+            o2 = odds_map.get(ranked[1]['horse'])
+            if o1 is not None and o2 is not None:
+                odds_product = o1 * o2
         if use_race_filter:
             if not passes_race_filter(
                 dist=r.get('dist'), n_horses=r.get('n_horses', len(ranked)),
                 venue=r.get('venue'), race_class=r.get('class'),
                 min_horses=min_horses, max_dist=max_dist,
                 exclude_venues=exclude_venues, allowed_classes=allowed_classes,
+                odds_product=odds_product, odds_lo=odds_lo, odds_hi=odds_hi,
+                require_odds=require_odds,
             ):
                 continue
         gap = ranked[0]['avg_venue_lpi'] - ranked[1]['avg_venue_lpi']
@@ -2398,6 +2424,23 @@ with tab_daily:
                 '未勝利・新馬のみ除外する(1勝クラス以上に絞らない)', value=False, key='filter_maiden_only',
                 help='オンにすると、2勝クラス以上等ではなく単に未勝利・新馬だけを除外する緩めの設定になります。'
             )
+            st.markdown('**オッズ積フィルター（検証済み・任意）**')
+            st.caption(
+                '軸(LPI1位)×相手1位(LPI2位)の単勝オッズの積が、指定範囲に入っているレースだけを候補にする。'
+                '2020-2026年重賞データの全馬総当たり検証で、オッズ積40〜120が回収率の「お得ゾーン」だった'
+                '(このゾーン以外だと馬単回収率が127%→303%等、大きく改善した実績あり)。'
+                '当日オッズCSVが必要。アップロードしない場合はこのフィルターはスキップされる。'
+            )
+            use_odds_filter = st.checkbox('オッズ積フィルターを使う', value=False, key='filter_use_odds')
+            col_o1, col_o2 = st.columns(2)
+            with col_o1:
+                filter_odds_lo = st.number_input('オッズ積の下限', min_value=1, max_value=1000, value=40, key='filter_odds_lo')
+            with col_o2:
+                filter_odds_hi = st.number_input('オッズ積の上限', min_value=1, max_value=2000, value=120, key='filter_odds_hi')
+            daily_odds_file = st.file_uploader(
+                '当日オッズCSV（1列目=馬名、2列目=単勝オッズ。ヘッダー行つき）',
+                type='csv', key='daily_odds', disabled=not use_odds_filter,
+            )
 
         n_partners = st.slider('相手の頭数（軸+相手のn点流し）', 2, 5, 3, key='daily_n_partners')
 
@@ -2574,11 +2617,31 @@ with tab_daily:
                     if filter_exclude_maiden_only:
                         allowed_cls = allowed_cls | {'不明'}
 
+                    daily_odds_map = None
+                    if use_odds_filter:
+                        if daily_odds_file is not None:
+                            try:
+                                odds_df = pd.read_csv(daily_odds_file, encoding='cp932')
+                            except Exception:
+                                daily_odds_file.seek(0)
+                                odds_df = pd.read_csv(daily_odds_file, encoding='utf-8-sig')
+                            name_col, odds_col = odds_df.columns[0], odds_df.columns[1]
+                            daily_odds_map = {
+                                str(r[name_col]).strip(): float(r[odds_col])
+                                for _, r in odds_df.iterrows()
+                                if pd.notna(r[odds_col])
+                            }
+                            st.caption(f'📊 当日オッズ: {len(daily_odds_map)}頭分を読み込みました。')
+                        else:
+                            st.warning('⚠️ オッズ積フィルターが有効ですが、当日オッズCSVが未アップロードのためスキップされます。')
+
                     selected = select_top_gap_races(
                         race_lpi_results, n_select=daily_n_select,
                         use_race_filter=use_race_filter,
                         min_horses=filter_min_horses, max_dist=filter_max_dist,
                         exclude_venues=venue_ex, allowed_classes=allowed_cls,
+                        odds_map=daily_odds_map, odds_lo=filter_odds_lo, odds_hi=filter_odds_hi,
+                        require_odds=False,
                     )
 
                     if use_race_filter and not selected:
@@ -2622,16 +2685,25 @@ with tab_daily:
                         gap = r['ranked'][0]['avg_venue_lpi'] - r['ranked'][1]['avg_venue_lpi']
                         is_selected = r['block_no'] in [s['block_no'] for s in selected]
                         venue_ex_check = {'東京'} if filter_exclude_tokyo else set()
+                        odds_product_check = None
+                        if daily_odds_map is not None:
+                            o1 = daily_odds_map.get(r['ranked'][0]['horse'])
+                            o2 = daily_odds_map.get(r['ranked'][1]['horse'])
+                            if o1 is not None and o2 is not None:
+                                odds_product_check = o1 * o2
                         passes = passes_race_filter(
                             r['dist'], r['n_horses'], r['venue'], r['class'],
                             min_horses=filter_min_horses, max_dist=filter_max_dist,
                             exclude_venues=venue_ex_check, allowed_classes=allowed_cls,
+                            odds_product=odds_product_check, odds_lo=filter_odds_lo, odds_hi=filter_odds_hi,
+                            require_odds=False,
                         )
                         all_rows.append({
                             'レース': r['race_label'], 'クラス': r['class'], '距離': f"{int(r['dist'])}m",
                             '出走頭数': r['n_horses'],
                             'LPI1位': r['ranked'][0]['horse'], 'LPI2位': r['ranked'][1]['horse'],
                             'gap': round(gap, 1),
+                            'オッズ積': round(odds_product_check, 1) if odds_product_check is not None else '-',
                             'フィルター該当': '✅' if passes else '-',
                             '厳選対象': '🏆' if is_selected else '-',
                         })
