@@ -14,6 +14,8 @@ import numpy as np
 import math
 import re
 import io
+import base64
+import requests
 from collections import Counter
 
 # ============================================================
@@ -1621,6 +1623,64 @@ def build_walk_columns_from_history(hist_valid, horse_name, n_past_runs=5):
     return rec
 
 
+# ============================================================
+# GitHub経由のログ自動保存
+# ------------------------------------------------------------
+# Streamlit Cloud等はファイルシステムが再起動で消えるため、
+# ログCSVをGitHubリポジトリ内のファイルとして直接読み書きすることで、
+# 手動アップロード/ダウンロードなしで自動的に蓄積できるようにする。
+#
+# 設定方法(st.secretsに以下を追加。Streamlit Cloudなら「Settings > Secrets」):
+#   GITHUB_TOKEN = "ghp_xxxxxxxx"     # repo write権限を持つPersonal Access Token
+#   GITHUB_REPO  = "ユーザー名/リポジトリ名"
+#   GITHUB_LOG_PATH = "logs/lpi_log.csv"   # リポジトリ内のログファイルパス(任意)
+#
+# 設定されていない場合は、従来通りの手動アップロード/ダウンロード方式にフォールバックする。
+# ============================================================
+
+def github_log_configured():
+    """st.secretsにGitHubログ保存に必要な設定が揃っているか"""
+    try:
+        return all(k in st.secrets for k in ('GITHUB_TOKEN', 'GITHUB_REPO', 'GITHUB_LOG_PATH'))
+    except Exception:
+        return False
+
+
+def github_get_log():
+    """GitHub上の既存ログを取得する。無ければ(None, None)を返す。"""
+    token = st.secrets['GITHUB_TOKEN']
+    repo = st.secrets['GITHUB_REPO']
+    path = st.secrets['GITHUB_LOG_PATH']
+    url = f'https://api.github.com/repos/{repo}/contents/{path}'
+    headers = {'Authorization': f'token {token}', 'Accept': 'application/vnd.github+json'}
+    resp = requests.get(url, headers=headers, timeout=15)
+    if resp.status_code == 200:
+        data = resp.json()
+        content = base64.b64decode(data['content']).decode('utf-8-sig')
+        return content, data['sha']
+    elif resp.status_code == 404:
+        return None, None
+    else:
+        raise RuntimeError(f'GitHub取得エラー: {resp.status_code} {resp.text[:200]}')
+
+
+def github_update_log(new_content_str, sha, message='update lpi log'):
+    """GitHub上のログファイルを新しい内容で上書き(またはsha未指定なら新規作成)する。"""
+    token = st.secrets['GITHUB_TOKEN']
+    repo = st.secrets['GITHUB_REPO']
+    path = st.secrets['GITHUB_LOG_PATH']
+    url = f'https://api.github.com/repos/{repo}/contents/{path}'
+    headers = {'Authorization': f'token {token}', 'Accept': 'application/vnd.github+json'}
+    content_b64 = base64.b64encode(new_content_str.encode('utf-8-sig')).decode('ascii')
+    payload = {'message': message, 'content': content_b64}
+    if sha:
+        payload['sha'] = sha
+    resp = requests.put(url, headers=headers, json=payload, timeout=15)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f'GitHub更新エラー: {resp.status_code} {resp.text[:200]}')
+    return resp.json()
+
+
 def parse_dn_file(dn_bytes):
     """
     DN形式ファイル(JRA-VAN等の出馬表エクスポート、固定幅TXT)を、
@@ -2502,127 +2562,170 @@ with tab_daily:
                         except Exception as e:
                             st.caption(f'block{i}: 計算スキップ（{e}）')
                         progress.progress(i / len(dn_races))
+                    st.session_state['daily_race_lpi_results'] = race_lpi_results
 
-                    if not race_lpi_results:
-                        st.warning('LPIを計算できたレースがありませんでした。')
-                    else:
-                        venue_ex = {'東京'} if filter_exclude_tokyo else set()
-                        allowed_cls = {'1勝クラス','2勝クラス','3勝クラス','L','オープン特別等','G1','G2','G3'}
-                        if filter_exclude_maiden_only:
-                            allowed_cls = allowed_cls | {'不明'}
+            if 'daily_race_lpi_results' in st.session_state:
+                race_lpi_results = st.session_state['daily_race_lpi_results']
+                if not race_lpi_results:
+                    st.warning('LPIを計算できたレースがありませんでした。')
+                else:
+                    venue_ex = {'東京'} if filter_exclude_tokyo else set()
+                    allowed_cls = {'1勝クラス','2勝クラス','3勝クラス','L','オープン特別等','G1','G2','G3'}
+                    if filter_exclude_maiden_only:
+                        allowed_cls = allowed_cls | {'不明'}
 
-                        selected = select_top_gap_races(
-                            race_lpi_results, n_select=daily_n_select,
-                            use_race_filter=use_race_filter,
-                            min_horses=filter_min_horses, max_dist=filter_max_dist,
-                            exclude_venues=venue_ex, allowed_classes=allowed_cls,
+                    selected = select_top_gap_races(
+                        race_lpi_results, n_select=daily_n_select,
+                        use_race_filter=use_race_filter,
+                        min_horses=filter_min_horses, max_dist=filter_max_dist,
+                        exclude_venues=venue_ex, allowed_classes=allowed_cls,
+                    )
+
+                    if use_race_filter and not selected:
+                        st.warning(
+                            '⚠️ 複合フィルターに該当するレースがありませんでした。'
+                            'フィルターをオフにするか、条件を緩めてください。'
                         )
 
-                        if use_race_filter and not selected:
-                            st.warning(
-                                '⚠️ 複合フィルターに該当するレースがありませんでした。'
-                                'フィルターをオフにするか、条件を緩めてください。'
-                            )
+                    st.subheader(f'🏆 本日の厳選{len(selected)}レース（gap = LPI1位と2位のスコア差）')
+                    for s in selected:
+                        ranked = s['ranked']
+                        axis = ranked[0]
+                        partners = ranked[1:1 + n_partners]
+                        st.markdown(
+                            f"**{s['race_label']}**　{int(s['dist'])}m {s['track']}　{s['class']}　"
+                            f"gap = **{s['gap']:.1f}**　（出走{s['n_horses']}頭）"
+                        )
+                        rows = [{
+                            'LPI順位': 1, '馬名': axis['horse'],
+                            'LPI': axis['avg_venue_lpi'], '役割': '🎯 軸（1着固定）',
+                        }]
+                        for j, p in enumerate(partners, start=2):
+                            rows.append({
+                                'LPI順位': j, '馬名': p['horse'],
+                                'LPI': p['avg_venue_lpi'], '役割': '相手候補（2着）',
+                            })
+                        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                        st.caption(
+                            f"馬単{n_partners}点: {axis['horse']} → "
+                            f"{' / '.join(p['horse'] for p in partners)}"
+                        )
+                        st.markdown('')
 
-                        st.subheader(f'🏆 本日の厳選{len(selected)}レース（gap = LPI1位と2位のスコア差）')
-                        for s in selected:
+                    st.session_state['daily_selected_for_log'] = selected
+                    st.session_state['daily_n_partners_for_log'] = n_partners
+
+                    st.subheader('📋 全レース一覧（gap順、複合フィルター適用状況つき）')
+                    all_rows = []
+                    for r in sorted(race_lpi_results,
+                                     key=lambda x: -(x['ranked'][0]['avg_venue_lpi'] - x['ranked'][1]['avg_venue_lpi'])):
+                        gap = r['ranked'][0]['avg_venue_lpi'] - r['ranked'][1]['avg_venue_lpi']
+                        is_selected = r['block_no'] in [s['block_no'] for s in selected]
+                        venue_ex_check = {'東京'} if filter_exclude_tokyo else set()
+                        passes = passes_race_filter(
+                            r['dist'], r['n_horses'], r['venue'], r['class'],
+                            min_horses=filter_min_horses, max_dist=filter_max_dist,
+                            exclude_venues=venue_ex_check, allowed_classes=allowed_cls,
+                        )
+                        all_rows.append({
+                            'レース': r['race_label'], 'クラス': r['class'], '距離': f"{int(r['dist'])}m",
+                            '出走頭数': r['n_horses'],
+                            'LPI1位': r['ranked'][0]['horse'], 'LPI2位': r['ranked'][1]['horse'],
+                            'gap': round(gap, 1),
+                            'フィルター該当': '✅' if passes else '-',
+                            '厳選対象': '🏆' if is_selected else '-',
+                        })
+                    st.dataframe(pd.DataFrame(all_rows), hide_index=True, use_container_width=True)
+
+                    # ============================================================
+                    # ログ記録セクション
+                    # ------------------------------------------------------------
+                    # Streamlit Cloud等はファイルシステムが再起動で消えるため、
+                    # 「既存ログCSVをアップロード → 今回の結果を追記 → ダウンロード」
+                    # という手元管理型にしている。ダウンロードしたファイルを
+                    # 次回また①でアップロードすれば、履歴が積み上がっていく。
+                    # ============================================================
+                    st.markdown('---')
+                    st.subheader('📝 ログに記録する')
+                    st.caption(
+                        '今回の厳選レースを記録します。着順・配当は後で結果が出てから、'
+                        'ログファイルを直接編集して埋めてください（この欄では空欄のまま出力します）。'
+                    )
+
+                    def _build_new_log_rows(selected_races, n_partners_):
+                        rows = []
+                        for s in selected_races:
                             ranked = s['ranked']
                             axis = ranked[0]
-                            partners = ranked[1:1 + n_partners]
-                            st.markdown(
-                                f"**{s['race_label']}**　{int(s['dist'])}m {s['track']}　{s['class']}　"
-                                f"gap = **{s['gap']:.1f}**　（出走{s['n_horses']}頭）"
-                            )
-                            rows = [{
-                                'LPI順位': 1, '馬名': axis['horse'],
-                                'LPI': axis['avg_venue_lpi'], '役割': '🎯 軸（1着固定）',
-                            }]
-                            for j, p in enumerate(partners, start=2):
-                                rows.append({
-                                    'LPI順位': j, '馬名': p['horse'],
-                                    'LPI': p['avg_venue_lpi'], '役割': '相手候補（2着）',
-                                })
-                            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-                            st.caption(
-                                f"馬単{n_partners}点: {axis['horse']} → "
-                                f"{' / '.join(p['horse'] for p in partners)}"
-                            )
-                            st.markdown('')
-
-                        st.session_state['daily_selected_for_log'] = selected
-                        st.session_state['daily_n_partners_for_log'] = n_partners
-
-                        st.subheader('📋 全レース一覧（gap順、複合フィルター適用状況つき）')
-                        all_rows = []
-                        for r in sorted(race_lpi_results,
-                                         key=lambda x: -(x['ranked'][0]['avg_venue_lpi'] - x['ranked'][1]['avg_venue_lpi'])):
-                            gap = r['ranked'][0]['avg_venue_lpi'] - r['ranked'][1]['avg_venue_lpi']
-                            is_selected = r['block_no'] in [s['block_no'] for s in selected]
-                            venue_ex_check = {'東京'} if filter_exclude_tokyo else set()
-                            passes = passes_race_filter(
-                                r['dist'], r['n_horses'], r['venue'], r['class'],
-                                min_horses=filter_min_horses, max_dist=filter_max_dist,
-                                exclude_venues=venue_ex_check, allowed_classes=allowed_cls,
-                            )
-                            all_rows.append({
-                                'レース': r['race_label'], 'クラス': r['class'], '距離': f"{int(r['dist'])}m",
-                                '出走頭数': r['n_horses'],
-                                'LPI1位': r['ranked'][0]['horse'], 'LPI2位': r['ranked'][1]['horse'],
-                                'gap': round(gap, 1),
-                                'フィルター該当': '✅' if passes else '-',
-                                '厳選対象': '🏆' if is_selected else '-',
+                            partners = ranked[1:1 + n_partners_]
+                            rows.append({
+                                '日付': s.get('date', ''),
+                                '会場': s.get('venue', ''),
+                                'R': s.get('race_no', ''),
+                                'クラス': s.get('class', ''),
+                                '距離': s.get('dist', ''),
+                                'トラック': s.get('track', ''),
+                                '出走頭数': s.get('n_horses', ''),
+                                'gap': round(s.get('gap', 0), 1),
+                                '軸': axis['horse'],
+                                '軸LPI': axis['avg_venue_lpi'],
+                                '相手1': partners[0]['horse'] if len(partners) > 0 else '',
+                                '相手2': partners[1]['horse'] if len(partners) > 1 else '',
+                                '相手3': partners[2]['horse'] if len(partners) > 2 else '',
+                                '相手4': partners[3]['horse'] if len(partners) > 3 else '',
+                                '実際1着': '', '実際2着': '',
+                                '馬単的中': '', '馬単配当': '',
+                                '馬連的中': '', '馬連配当': '',
+                                'メモ': '',
                             })
-                        st.dataframe(pd.DataFrame(all_rows), hide_index=True, use_container_width=True)
+                        return pd.DataFrame(rows)
 
-                        # ============================================================
-                        # ログ記録セクション
-                        # ------------------------------------------------------------
-                        # Streamlit Cloud等はファイルシステムが再起動で消えるため、
-                        # 「既存ログCSVをアップロード → 今回の結果を追記 → ダウンロード」
-                        # という手元管理型にしている。ダウンロードしたファイルを
-                        # 次回また①でアップロードすれば、履歴が積み上がっていく。
-                        # ============================================================
-                        st.markdown('---')
-                        st.subheader('📝 ログに記録する')
-                        st.caption(
-                            '今回の厳選レースを記録します。着順・配当は後で結果が出てから'
-                            'ダウンロードしたCSVを直接編集して埋めてください（この欄では空欄のまま出力します）。'
-                        )
+                    if github_log_configured():
+                        st.success('🔗 GitHub自動保存が設定されています。ボタン1つでログが蓄積されます（アップロード不要）。')
+                        if st.button('📝 今回の結果を自動でログに追加する', key='daily_log_append_github', type='primary'):
+                            try:
+                                with st.spinner('GitHub上の既存ログを取得中...'):
+                                    old_content, sha = github_get_log()
+                                new_log_df = _build_new_log_rows(selected, n_partners)
+
+                                if old_content is not None:
+                                    old_log_df = pd.read_csv(io.StringIO(old_content))
+                                    combined_log_df = pd.concat([old_log_df, new_log_df], ignore_index=True)
+                                    combined_log_df = combined_log_df.drop_duplicates(
+                                        subset=['日付', '会場', 'R', '軸'], keep='last'
+                                    )
+                                else:
+                                    combined_log_df = new_log_df
+
+                                new_content_str = combined_log_df.to_csv(index=False)
+                                with st.spinner('GitHubに保存中...'):
+                                    github_update_log(
+                                        new_content_str, sha,
+                                        message=f'update lpi log ({selected[0].get("date","")}時点、{len(new_log_df)}件追加)'
+                                    )
+                                st.success(f'✅ GitHubに保存しました。累計{len(combined_log_df)}件。')
+                                st.dataframe(combined_log_df, hide_index=True, use_container_width=True)
+                            except Exception as e:
+                                st.error(f'GitHub保存に失敗しました: {e}')
+                    else:
+                        with st.expander('💡 毎回のアップロード/ダウンロードが面倒な場合（GitHub自動保存の設定方法）'):
+                            st.markdown(
+                                '1. GitHubで **Settings → Developer settings → Personal access tokens** から'
+                                'repo write権限つきのトークンを発行\n'
+                                '2. Streamlit Cloudのアプリ管理画面 → **Settings → Secrets** に以下を追加:\n'
+                                '```\nGITHUB_TOKEN = "ghp_xxxxxxxx"\n'
+                                'GITHUB_REPO = "ユーザー名/リポジトリ名"\n'
+                                'GITHUB_LOG_PATH = "logs/lpi_log.csv"\n```\n'
+                                '3. 保存すると自動で再起動され、次回からボタン1つでログがGitHubに蓄積されます。'
+                            )
+
                         existing_log_file = st.file_uploader(
                             '既存のログCSV（あれば）。無ければ空のまま次に進んでOKです。',
                             type='csv', key='daily_log_upload'
                         )
 
                         if st.button('📝 今回の結果をログに追加してダウンロード', key='daily_log_append'):
-                            log_rows = []
-                            for s in selected:
-                                ranked = s['ranked']
-                                axis = ranked[0]
-                                partners = ranked[1:1 + n_partners]
-                                log_rows.append({
-                                    '日付': s.get('date', ''),
-                                    '会場': s.get('venue', ''),
-                                    'R': s.get('race_no', ''),
-                                    'クラス': s.get('class', ''),
-                                    '距離': s.get('dist', ''),
-                                    'トラック': s.get('track', ''),
-                                    '出走頭数': s.get('n_horses', ''),
-                                    'gap': round(s.get('gap', 0), 1),
-                                    '軸': axis['horse'],
-                                    '軸LPI': axis['avg_venue_lpi'],
-                                    '相手1': partners[0]['horse'] if len(partners) > 0 else '',
-                                    '相手2': partners[1]['horse'] if len(partners) > 1 else '',
-                                    '相手3': partners[2]['horse'] if len(partners) > 2 else '',
-                                    '相手4': partners[3]['horse'] if len(partners) > 3 else '',
-                                    '実際1着': '',   # 後で手入力
-                                    '実際2着': '',   # 後で手入力
-                                    '馬単的中': '',   # 後で手入力(○/×)
-                                    '馬単配当': '',   # 後で手入力
-                                    '馬連的中': '',   # 後で手入力(○/×)
-                                    '馬連配当': '',   # 後で手入力
-                                    'メモ': '',
-                                })
-                            new_log_df = pd.DataFrame(log_rows)
+                            new_log_df = _build_new_log_rows(selected, n_partners)
 
                             if existing_log_file is not None:
                                 try:
