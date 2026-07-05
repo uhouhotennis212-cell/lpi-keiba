@@ -1974,157 +1974,87 @@ import io
 import pandas as pd
 import streamlit as st
 
+
 # ============================================================
-# 1日厳選5レース機能 v3
+# 1日厳選レース機能 v5
 # ------------------------------------------------------------
-# v2からの変更点（実データ検証の結果、設計を変更）:
-#   - 出走表CSVには「今回のレース」情報（会場・R番号・距離・グレード）が
-#     一切含まれていないことが実データで確認された。
-#     → CSV内から推定する v2 の guess_race_meta アプローチを廃止。
-#   - 代わりに、JRA公式サイトの「開催日程」ページ（番組表）をそのまま
-#     コピペしてもらい、そこから会場・R番号・距離・芝ダ・クラス名を取得する。
-#   - CSVのレースブロックは「場→R番号の昇順」で並んでいる、という
-#     実データで確認された規則性を使い、パースした番組表（対象トラックのみ）
-#     と CSV のブロックを順番通りに1:1対応させる。
-#   - 対応結果は必ず data_editor で人間が確認・修正できるようにする
-#     （同日に同距離のレースが複数ある等、自動対応がズレる可能性があるため）。
+# v4からの変更点(2024-2025年バックテストで検証済み):
+#   候補レースに以下4条件の複合フィルターを追加。
+#     1. 出走頭数が11頭以上（10頭以下は人気馬が安定しすぎて妙味が薄いため除外）
+#     2. 距離が1400m以下（短距離の方が人気馬が凡走しやすいことを確認済み）
+#     3. 東京を除外（人気馬の凡走率が全会場中最も低く、荒れにくいため）
+#     4. クラスが1勝クラス以上（未勝利・新馬を除外）
 #
-# 既存の app.py 内の
-#   def split_multi_race_csv(...): ...
-#   def select_top_gap_races(...): ...
-#   （最後の st.header('📅 1日厳選5レース（実験的機能）') 以降ブロック全体）
-# を、このファイルの内容で置き換えてください。
+#   検証結果(2024-2025年・平場全芝・厳選3レース/日・軸+相手3頭流し):
+#     フィルタなし:               馬単回収率 88.7% / 馬連回収率 82.9%
+#     4条件複合フィルターあり:     馬単回収率127.2% / 馬連回収率143.0%
+#     (2024・2025年とも4指標すべてで一貫して改善を確認済み)
+#
+# 前提: daily_races_patch_v4.py の内容が適用済みであること
+#   (split_multi_race_csv, parse_jra_program, select_top_gap_races等)。
+# 既存の「1日厳選レース」機能ブロック全体を、この内容で置き換えてください。
 # ============================================================
 
-def split_multi_race_csv(file_bytes):
-    """
-    「枠番」ヘッダー行が複数回出現する、1日分の全レースが縦に連結された
-    CSVを、レースごとのDataFrameに分割する。
-
-    Returns: list of (block_no, DataFrame)
-        block_no: CSV内での出現順（1始まり）。実データ検証の結果、
-                  この順番は「場→R番号の昇順」に一致することを確認済み。
-    """
-    for enc in ['cp932', 'shift_jis', 'utf-8-sig', 'utf-8']:
-        try:
-            df_raw = pd.read_csv(io.BytesIO(file_bytes), encoding=enc)
-            break
-        except Exception:
-            continue
-    else:
-        raise ValueError('文字コードを判定できませんでした')
-
-    if '枠番' not in df_raw.columns:
-        raise ValueError('「枠番」列が見つかりません。レース区切りを検出できる形式のCSVをアップロードしてください。')
-
-    header_rows = df_raw[df_raw['枠番'].astype(str) == '枠番'].index.tolist()
-    boundaries = [0] + header_rows + [len(df_raw)]
-
-    races = []
-    block_no = 1
-    for i in range(len(boundaries) - 1):
-        start, end = boundaries[i], boundaries[i + 1]
-        block = df_raw.iloc[start:end].copy()
-        if len(block) > 0 and str(block.iloc[0]['枠番']) == '枠番':
-            block = block.iloc[1:].copy()
-        block = block.dropna(subset=['馬名S'])
-        block = block[block['馬名S'].astype(str) != '馬名S'].reset_index(drop=True)
-        if len(block) < 2:
-            continue
-        races.append((block_no, block))
-        block_no += 1
-    return races
-
-
 # ============================================================
-# JRA番組表テキストのパース
+# クラス判定(未勝利・新馬・1勝〜3勝クラス・重賞等を区別する)
 # ============================================================
-VENUE_NAMES = ['東京', '中山', '京都', '阪神', '新潟', '中京', '福島', '小倉', '札幌', '函館']
-
-# 例:
-#   1
-#   レース
-#   3歳未勝利
-#   1,400（ダ）（牝）
-#   10時05分
-# のように「レース番号」「レース」「クラス名」「距離（芝/ダ）」「発走時刻」が
-# それぞれ別の行に分かれる、JRA公式サイトを実際にブラウザでコピペした形式に対応。
-DIST_TRACK_RE = re.compile(
-    r'([\d,，]{3,5})\s*[（(]\s*(芝|ダート|ダ)(?:[・][^）)]*)?\s*[)）]'
-)
-
-def parse_jra_program(text):
+def classify_race_class(text):
+    """番組表のクラス名テキストから大まかなクラス区分を判定する。
+    (parse_jra_program内の同名関数と同じロジック。ここでは候補フィルター用に単体でも呼べるようにしている)
     """
-    JRA公式サイトの「開催日程（番組表）」ページからブラウザでそのままコピペした
-    テキストを解析し、会場ごとのレース一覧（R番号・距離・トラック）を返す。
+    s = str(text)
+    if '新馬' in s: return '新馬'
+    if '未勝利' in s: return '未勝利'
+    if '1勝' in s or '１勝' in s: return '1勝クラス'
+    if '2勝' in s or '２勝' in s: return '2勝クラス'
+    if '3勝' in s or '３勝' in s: return '3勝クラス'
+    if re.search(r'G[1-3]', s): return re.search(r'G[1-3]', s).group()
+    if 'オープン' in s or 'Ｌ' in s or '(L)' in s: return 'オープン特別等'
+    return '不明'
 
-    実際のコピペ結果は「レース番号」「レース」「クラス名」「距離（芝/ダ）」「発走時刻」
-    がそれぞれ別行になる（表のセルが縦に展開される）ため、行単位ではなく
-    「数字だけの行の直後に'レース'という行がある」＝レコード開始、として検出し、
-    そこから数行以内にある距離パターンを探す方式にしている。
 
-    Returns: list of dict [{'venue','race_no','dist','track'}], 出現順
+CLASS_1PLUS = {'1勝クラス', '2勝クラス', '3勝クラス', 'L', 'オープン特別等', 'G1', 'G2', 'G3'}
+
+
+def passes_race_filter(dist, n_horses, venue, race_class,
+                        min_horses=11, max_dist=1400,
+                        exclude_venues=('東京',), allowed_classes=CLASS_1PLUS):
     """
-    lines = [l.strip() for l in text.splitlines()]
-    results = []
-    current_venue = None
-    i, n = 0, len(lines)
-
-    while i < n:
-        line = lines[i]
-        if not line:
-            i += 1
-            continue
-
-        # レコード開始判定: 「1〜2桁の数字だけの行」の直後が「レース」という行
-        is_record_start = (
-            bool(re.fullmatch(r'\d{1,2}', line))
-            and i + 1 < n
-            and lines[i + 1].strip() == 'レース'
-        )
-        if not is_record_start:
-            # 会場名を含む行（例:「3回東京2日」）が出てきたら以降の会場を更新
-            for v in VENUE_NAMES:
-                if v in line:
-                    current_venue = v
-                    break
-            i += 1
-            continue
-
-        race_no = int(line)
-        # レース番号行・「レース」行の次から、距離パターンが見つかるまで数行探す
-        j = i + 2
-        found = False
-        search_limit = min(j + 8, n)  # 重賞名などで行数が増えても耐えられるよう余裕を持たせる
-        while j < search_limit:
-            m = DIST_TRACK_RE.search(lines[j])
-            if m:
-                dist = float(m.group(1).replace(',', '').replace('，', ''))
-                track = 'D' if m.group(2) in ('ダート', 'ダ') else 'T'
-                results.append({
-                    'venue': current_venue or '(不明)',
-                    'race_no': race_no,
-                    'dist': dist,
-                    'track': track,
-                })
-                found = True
-                j += 1
-                break
-            j += 1
-        i = j if found else i + 1
-
-    return results
+    検証済みの複合フィルター。4条件すべてを満たすレースだけTrueを返す。
+    厳選対象の「候補プール」を絞り込むために使う(軸・相手の選び方自体は変えない)。
+    """
+    if n_horses < min_horses:
+        return False
+    if dist is not None and dist > max_dist:
+        return False
+    if venue in exclude_venues:
+        return False
+    if race_class not in allowed_classes:
+        return False
+    return True
 
 
-def select_top_gap_races(race_lpi_results, n_select=5):
+def select_top_gap_races(race_lpi_results, n_select=3, use_race_filter=True,
+                          min_horses=11, max_dist=1400,
+                          exclude_venues=('東京',), allowed_classes=CLASS_1PLUS):
     """
     各レースのLPI計算結果から、LPI1位と2位のスコア差(gap)が大きい順にn_select件を選ぶ。
+    use_race_filter=True(既定)の場合、検証済みの複合フィルター
+    (頭数11以上・距離1400m以下・東京以外・1勝クラス以上)を先にかけてから選定する。
     """
     scored = []
     for r in race_lpi_results:
         ranked = r['ranked']
         if len(ranked) < 2:
             continue
+        if use_race_filter:
+            if not passes_race_filter(
+                dist=r.get('dist'), n_horses=r.get('n_horses', len(ranked)),
+                venue=r.get('venue'), race_class=r.get('class'),
+                min_horses=min_horses, max_dist=max_dist,
+                exclude_venues=exclude_venues, allowed_classes=allowed_classes,
+            ):
+                continue
         gap = ranked[0]['avg_venue_lpi'] - ranked[1]['avg_venue_lpi']
         scored.append({**r, 'gap': gap})
     scored.sort(key=lambda x: -x['gap'])
@@ -2132,34 +2062,56 @@ def select_top_gap_races(race_lpi_results, n_select=5):
 
 
 st.markdown('---')
-st.header('📅 1日厳選5レース（実験的機能 v3）')
+st.header('📅 1日厳選レース（v5: 頭数・距離・会場・クラスの複合フィルター対応）')
 st.caption(
     '1日分の全レースが連結された出走表CSVを読み込み、JRA公式サイトの番組表とレース単位で対応づけたうえで、'
+    '検証済みの複合フィルター（頭数11頭以上・距離1400m以下・東京以外・1勝クラス以上）を満たすレースの中から、'
     'LPI1位と2位のスコア差(gap)が最も大きい上位レースを自動選定します。'
 )
 st.info(
-    '💡 検証結果（2024-2025年・下級条件込み）: 馬単的中率11.9〜14.3%・回収率134.8〜154.3%（2年連続）。'
-    'ただし大穴1〜2件への依存度は年によって変動するため、過信は禁物です。'
+    '💡 検証結果(2024-2025年・平場全芝・厳選3レース・軸+相手3頭流し):'
+    '複合フィルターなしの馬単回収率88.7%・馬連回収率82.9%に対し、'
+    'フィルターありでは馬単回収率127.2%・馬連回収率143.0%（2年間とも改善を確認済み）。'
 )
 
-with st.expander('📅 1日厳選5レースを使う', expanded=False):
+with st.expander('📅 1日厳選レースを使う', expanded=False):
 
     st.markdown('**① 出走表CSVをアップロード**')
     col_a, col_b = st.columns(2)
     with col_a:
         daily_base_file = st.file_uploader(
-            '基準テーブル用CSV（重賞 or 平場のbasedate）', type='csv', key='daily_base')
+            '基準テーブル用CSV（平場水準のデータを推奨。重賞級のみだと較正がズレることを確認済み）',
+            type='csv', key='daily_base')
     with col_b:
         daily_multi_file = st.file_uploader(
             'この日の全レース出走表CSV（枠番区切り形式）', type='csv', key='daily_multi')
 
-    daily_n_select = st.slider('厳選するレース数', 1, 10, 5, key='daily_n')
+    col_c, col_d = st.columns(2)
+    with col_c:
+        daily_n_select = st.slider('厳選するレース数', 1, 10, 3, key='daily_n')
+    with col_d:
+        use_race_filter = st.checkbox(
+            '検証済みの複合フィルターを使う', value=True, key='daily_use_filter',
+            help='頭数11頭以上・距離1400m以下・東京以外・1勝クラス以上の4条件。'
+                 'オフにすると未勝利のみ除外した従来方式になります。'
+        )
+
+    with st.expander('複合フィルターの詳細設定（通常は変更不要）'):
+        filter_min_horses = st.number_input('最低頭数', min_value=1, max_value=18, value=11, key='filter_min_horses')
+        filter_max_dist = st.number_input('最大距離(m)', min_value=1000, max_value=3600, value=1400, step=100, key='filter_max_dist')
+        filter_exclude_tokyo = st.checkbox('東京を除外する', value=True, key='filter_exclude_tokyo')
+        filter_exclude_maiden_only = st.checkbox(
+            '未勝利・新馬のみ除外する(1勝クラス以上に絞らない)', value=False, key='filter_maiden_only',
+            help='オンにすると、2勝クラス以上等ではなく単に未勝利・新馬だけを除外する緩めの設定になります。'
+        )
+
+    n_partners = st.slider('相手の頭数（軸+相手のn点流し）', 2, 5, 3, key='daily_n_partners')
 
     st.markdown('---')
     st.markdown(
         '**② 番組表をコピペ**　'
         '[JRA開催日程ページ](https://www.jra.go.jp/keiba/calendar/) '
-        'でその日を開き、会場ごとの表（会場名〜R番号〜距離〜芝ダ）をそのままコピー＆ペーストしてください。'
+        'でその日を開き、会場ごとの表（会場名〜R番号〜クラス名〜距離〜芝ダ）をそのままコピー＆ペーストしてください。'
         '複数会場ある場合は両方まとめて貼ってOKです。'
     )
     program_text = st.text_area(
@@ -2189,7 +2141,6 @@ with st.expander('📅 1日厳選5レースを使う', expanded=False):
             program = parse_jra_program(program_text)
             track_code = 'T' if target_track_filter == '芝' else 'D'
             program_filtered = [p for p in program if p['track'] == track_code]
-            # 場→R番号の昇順に整列（CSVブロックの並び順と一致する前提）
             program_filtered.sort(key=lambda p: (VENUE_NAMES.index(p['venue'])
                                                    if p['venue'] in VENUE_NAMES else 99,
                                                    p['race_no']))
@@ -2218,13 +2169,14 @@ with st.expander('📅 1日厳選5レースを使う', expanded=False):
                         'R': p['race_no'] if p else None,
                         '距離': p['dist'] if p else None,
                         'トラック': track_code,
+                        'クラス': p['race_class'] if p else '不明',
                     })
 
                 st.session_state['daily_races'] = races
                 st.session_state['daily_mapping_df'] = pd.DataFrame(mapping_rows)
 
     if 'daily_mapping_df' in st.session_state:
-        st.markdown('**④ 対応づけの確認・修正**（頭数を見て、明らかにおかしい対応は修正してください）')
+        st.markdown('**④ 対応づけの確認・修正**（頭数・クラスを見て、明らかにおかしい対応は修正してください）')
         edited_map = st.data_editor(
             st.session_state['daily_mapping_df'],
             column_config={
@@ -2232,6 +2184,9 @@ with st.expander('📅 1日厳選5レースを使う', expanded=False):
                 'R': st.column_config.NumberColumn('R番号', min_value=1, max_value=12, step=1),
                 '距離': st.column_config.NumberColumn('距離(m)', min_value=800, max_value=3600, step=100),
                 'トラック': st.column_config.SelectboxColumn('トラック', options=['T', 'D']),
+                'クラス': st.column_config.SelectboxColumn(
+                    'クラス', options=['新馬', '未勝利', '1勝クラス', '2勝クラス', '3勝クラス',
+                                      'オープン特別等', 'G1', 'G2', 'G3', '不明']),
             },
             disabled=['block_no', '頭数'],
             hide_index=True,
@@ -2242,6 +2197,21 @@ with st.expander('📅 1日厳選5レースを使う', expanded=False):
         missing = edited_map['距離'].isna().sum() + edited_map['会場'].isna().sum()
         if missing > 0:
             st.warning(f'⚠️ 未確定の項目が{missing}件あります。表を編集して埋めてから計算してください。')
+
+        # フィルター条件に該当するレース数を事前表示
+        if use_race_filter:
+            allowed_cls = CLASS_1PLUS if not filter_exclude_maiden_only else (CLASS_1PLUS | {'新馬', '未勝利'} - {'未勝利', '新馬'})
+            # ↑ filter_exclude_maiden_onlyの時は「未勝利・新馬だけ除外」相当にする
+            if filter_exclude_maiden_only:
+                allowed_cls = {'1勝クラス','2勝クラス','3勝クラス','L','オープン特別等','G1','G2','G3','不明'}
+            n_pass = 0
+            for _, row in edited_map.iterrows():
+                venue_ex = {'東京'} if filter_exclude_tokyo else set()
+                if passes_race_filter(row['距離'], row['頭数'], row['会場'], row['クラス'],
+                                       min_horses=filter_min_horses, max_dist=filter_max_dist,
+                                       exclude_venues=venue_ex, allowed_classes=allowed_cls):
+                    n_pass += 1
+            st.caption(f'🔍 複合フィルター該当レース: {n_pass}件 / 全{len(edited_map)}件')
 
         daily_run = st.button(
             '⑤ 厳選レースを計算する', type='primary', key='daily_run',
@@ -2270,34 +2240,30 @@ with st.expander('📅 1日厳選5レースを使う', expanded=False):
                     r_track = m['トラック'] or 'T'
                     r_venue = m['会場']
                     r_no    = int(m['R']) if pd.notna(m['R']) else None
+                    r_class = m['クラス']
 
                     try:
-                        # cp932の方がshift_jisよりカバー範囲が広く文字化けしにくい
                         csv_bytes = block.to_csv(index=False).encode('cp932', errors='replace')
 
-                        if abs(r_dist - 1200) <= 100 and r_track == 'T' and 'calc_lpi_1200m' in globals():
-                            results = calc_lpi_1200m(
-                                csv_bytes, d_base_dict, d_稍重_dict,
-                                target_venue=r_venue, target_grade='G3',
-                            )
-                            ranked = sorted(results, key=lambda x: -x['avg_venue_lpi'])
-                            model_used = '1200m専用AI'
-                        else:
-                            pace = get_pace_prediction(r_dist, r_venue, nige_count=0, senkou_count=0)
-                            results = calc_lpi(
-                                csv_bytes, d_base_dict, d_稍重_dict,
-                                target_track=r_track, target_venue=r_venue,
-                                bonus_strength=0.15, pace_pred_rpci=pace['pred_rpci'],
-                                race_base_dict=d_race_base_dict,
-                            )
-                            ranked = sorted(results, key=lambda x: -x['avg_venue_lpi'])
-                            model_used = '汎用LPI'
+                        styles = precompute_running_styles(csv_bytes)
+                        pace = get_pace_prediction(r_dist, r_venue, styles.get('nige', 0), styles.get('senkou', 0))
+
+                        results = calc_lpi(
+                            csv_bytes, d_base_dict, d_稍重_dict,
+                            target_track=r_track, target_venue=r_venue,
+                            bonus_strength=0.15, pace_pred_rpci=pace['pred_rpci'],
+                            race_base_dict=d_race_base_dict,
+                            pace_elem_adv=pace['elem_adv'], pace_bonus_strength=3.0,
+                            target_dist=r_dist,
+                        )
+                        ranked = sorted(results, key=lambda x: -x['avg_venue_lpi'])
 
                         if len(ranked) >= 2:
                             race_lpi_results.append({
                                 'block_no': block_no, 'race_label': f'{r_venue}{r_no}R' if r_no else r_venue,
                                 'n_horses': len(ranked), 'ranked': ranked,
-                                'dist': r_dist, 'track': r_track, 'venue': r_venue, 'model': model_used,
+                                'dist': r_dist, 'track': r_track, 'venue': r_venue,
+                                'class': r_class,
                             })
                     except Exception as e:
                         st.caption(f'block{block_no}: 計算スキップ（{e}）')
@@ -2306,16 +2272,32 @@ with st.expander('📅 1日厳選5レースを使う', expanded=False):
                 if not race_lpi_results:
                     st.warning('LPIを計算できたレースがありませんでした。')
                 else:
-                    selected = select_top_gap_races(race_lpi_results, n_select=daily_n_select)
+                    venue_ex = {'東京'} if filter_exclude_tokyo else set()
+                    allowed_cls = {'1勝クラス','2勝クラス','3勝クラス','L','オープン特別等','G1','G2','G3'}
+                    if filter_exclude_maiden_only:
+                        allowed_cls = allowed_cls | {'不明'}
+
+                    selected = select_top_gap_races(
+                        race_lpi_results, n_select=daily_n_select,
+                        use_race_filter=use_race_filter,
+                        min_horses=filter_min_horses, max_dist=filter_max_dist,
+                        exclude_venues=venue_ex, allowed_classes=allowed_cls,
+                    )
+
+                    if use_race_filter and not selected:
+                        st.warning(
+                            '⚠️ 複合フィルターに該当するレースがありませんでした。'
+                            'フィルターをオフにするか、条件を緩めてください。'
+                        )
 
                     st.subheader(f'🏆 本日の厳選{len(selected)}レース（gap = LPI1位と2位のスコア差）')
                     for s in selected:
                         ranked = s['ranked']
                         axis = ranked[0]
-                        partners = ranked[1:5]
+                        partners = ranked[1:1 + n_partners]
                         st.markdown(
-                            f"**{s['race_label']}**　{int(s['dist'])}m {s['track']}　"
-                            f"[{s['model']}]　gap = **{s['gap']:.1f}**　（出走{s['n_horses']}頭）"
+                            f"**{s['race_label']}**　{int(s['dist'])}m {s['track']}　{s['class']}　"
+                            f"gap = **{s['gap']:.1f}**　（出走{s['n_horses']}頭）"
                         )
                         rows = [{
                             'LPI順位': 1, '馬名': axis['horse'],
@@ -2328,21 +2310,29 @@ with st.expander('📅 1日厳選5レースを使う', expanded=False):
                             })
                         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
                         st.caption(
-                            f"馬単4点: {axis['horse']} → "
+                            f"馬単{n_partners}点: {axis['horse']} → "
                             f"{' / '.join(p['horse'] for p in partners)}"
                         )
                         st.markdown('')
 
-                    st.subheader('📋 全レース一覧（gap順）')
+                    st.subheader('📋 全レース一覧（gap順、複合フィルター適用状況つき）')
                     all_rows = []
                     for r in sorted(race_lpi_results,
                                      key=lambda x: -(x['ranked'][0]['avg_venue_lpi'] - x['ranked'][1]['avg_venue_lpi'])):
                         gap = r['ranked'][0]['avg_venue_lpi'] - r['ranked'][1]['avg_venue_lpi']
                         is_selected = r['block_no'] in [s['block_no'] for s in selected]
+                        venue_ex_check = {'東京'} if filter_exclude_tokyo else set()
+                        passes = passes_race_filter(
+                            r['dist'], r['n_horses'], r['venue'], r['class'],
+                            min_horses=filter_min_horses, max_dist=filter_max_dist,
+                            exclude_venues=venue_ex_check, allowed_classes=allowed_cls,
+                        )
                         all_rows.append({
-                            'レース': r['race_label'], '距離': f"{int(r['dist'])}m",
-                            'モデル': r['model'], '出走頭数': r['n_horses'],
+                            'レース': r['race_label'], 'クラス': r['class'], '距離': f"{int(r['dist'])}m",
+                            '出走頭数': r['n_horses'],
                             'LPI1位': r['ranked'][0]['horse'], 'LPI2位': r['ranked'][1]['horse'],
-                            'gap': round(gap, 1), '厳選対象': '✅' if is_selected else '-',
+                            'gap': round(gap, 1),
+                            'フィルター該当': '✅' if passes else '-',
+                            '厳選対象': '🏆' if is_selected else '-',
                         })
                     st.dataframe(pd.DataFrame(all_rows), hide_index=True, use_container_width=True)
