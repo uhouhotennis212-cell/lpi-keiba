@@ -1540,6 +1540,142 @@ def select_top_gap_races(race_lpi_results, n_select=3, use_race_filter=True,
     return scored[:n_select]
 
 
+# ============================================================
+# DN形式ファイル(JRA-VAN等の出馬表エクスポート、固定幅TXT)のパーサー
+# ------------------------------------------------------------
+# 過去走データ(33列・ヘッダーなしCSV)と、当日の全レース(DN形式TXT)から、
+# 直接LPI計算用のエントリーを組み立てる(中間CSVの手動生成が不要)。
+# ============================================================
+
+# 過去走データの列マッピング(選択済み項目33項目の順番通り。実データ突き合わせで確認済み)
+HIST_COL_年 = 0; HIST_COL_月 = 1; HIST_COL_日 = 2; HIST_COL_場所 = 4; HIST_COL_芝ダ = 6
+HIST_COL_距離 = 7; HIST_COL_馬場状態 = 8; HIST_COL_馬名 = 9; HIST_COL_確定着順 = 16
+HIST_COL_上がり3F = 27; HIST_COL_地点差 = 30; HIST_COL_PCI = 31; HIST_COL_RPCI = 32
+
+DN_HEADER_RE = re.compile(
+    r'(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日\([^)]+\)\s*(\d)回(\S+?)(\d+)日目\s*([\d:]+)発走'
+)
+DN_RACE_NO_RE = re.compile(r'([０-９\d]+)Ｒ')
+DN_CLASS_DIST_RE = re.compile(r'(.+?)\s*(芝|ダ)\s*(\d+)m\s*(\d+)頭立')
+DN_ENTRY_RE = re.compile(
+    r'^\s*(?:B)?(\d+)\s+(\d+)\$?\s*(\S+?)\s+(牡|牝|セ)(\d+)\s*\*?(\S+?)\s*(\d+(?:\.\d+)?)',
+    re.MULTILINE
+)
+
+
+def zen2han(s):
+    return s.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
+
+
+@st.cache_data
+def load_history_data(file_bytes):
+    """過去走データ(33列・ヘッダーなしCSV)を読み込み、馬名検索用に整形する。"""
+    for enc in ['cp932', 'shift_jis', 'utf-8-sig', 'utf-8']:
+        try:
+            hist = pd.read_csv(io.BytesIO(file_bytes), encoding=enc, header=None)
+            break
+        except (UnicodeDecodeError, Exception):
+            continue
+    else:
+        raise ValueError('過去走データCSVの文字コードを判定できませんでした')
+
+    if hist.shape[1] != 33:
+        raise ValueError(f'過去走データの列数が{hist.shape[1]}列です(想定は33列)。ファイル形式を確認してください。')
+
+    hist['日付_num'] = hist[HIST_COL_年] * 10000 + hist[HIST_COL_月] * 100 + hist[HIST_COL_日]
+    hist['上がり_num'] = pd.to_numeric(hist[HIST_COL_上がり3F], errors='coerce')
+    hist['レース名_簡易'] = (hist[HIST_COL_場所].astype(str) + hist[HIST_COL_距離].astype(str)
+                            + hist[HIST_COL_芝ダ].astype(str))
+    return hist.dropna(subset=['上がり_num'])
+
+
+def build_walk_columns_from_history(hist_valid, horse_name, n_past_runs=5):
+    """馬名から、直近n_past_runs走ぶんのWALK_DEFS互換列(dict)を作る。"""
+    sub = (hist_valid[hist_valid[HIST_COL_馬名] == horse_name]
+           .sort_values('日付_num', ascending=False)
+           .head(n_past_runs)
+           .reset_index(drop=True))
+    rec = {}
+    for n in range(1, n_past_runs + 1):
+        suffix = '' if n == 1 else f'.{n-1}'
+        if n - 1 < len(sub):
+            r = sub.iloc[n - 1]
+            rec[f'上り3F{suffix}']    = r[HIST_COL_上がり3F]
+            rec[f'RPCI{suffix}']      = r[HIST_COL_RPCI]
+            if n > 1:
+                rec[f'PCI{suffix}']  = r[HIST_COL_PCI]
+            rec[f'場所{suffix}']      = r[HIST_COL_場所]
+            rec[f'距離{suffix}']      = r[HIST_COL_距離]
+            rec[f'馬場状態{suffix}']  = r[HIST_COL_馬場状態]
+            rec[f'着順{suffix}']      = r[HIST_COL_確定着順]
+            rec[f'ﾚｰｽ名･{n}走前']    = r['レース名_簡易']
+            rec[f'TD{suffix}']        = r[HIST_COL_芝ダ]
+            rec[f'-3F差{suffix}']     = r[HIST_COL_地点差]
+        else:
+            keys = ['上り3F', 'RPCI', '場所', '距離', '馬場状態', '着順', 'TD', '-3F差']
+            if n > 1:
+                keys.append('PCI')
+            for key in keys:
+                rec[f'{key}{suffix}'] = np.nan
+            rec[f'ﾚｰｽ名･{n}走前'] = np.nan
+    return rec
+
+
+def parse_dn_file(dn_bytes):
+    """
+    DN形式ファイル(JRA-VAN等の出馬表エクスポート、固定幅TXT)を、
+    レースごとのメタ情報(会場・R・クラス・距離・トラック・頭数)と
+    出走馬一覧(枠番・馬番・馬名・性別・年齢・騎手・斤量)に分解する。
+
+    Returns: list of dict [{'venue','race_no','race_name','race_class',
+                             'track','dist','n_horses','n_entries_parsed','entries'}]
+    """
+    for enc in ['cp932', 'shift_jis', 'utf-8-sig', 'utf-8']:
+        try:
+            text = dn_bytes.decode(enc, errors='strict')
+            break
+        except (UnicodeDecodeError, Exception):
+            text = dn_bytes.decode('cp932', errors='replace')
+            break
+
+    header_matches = list(DN_HEADER_RE.finditer(text))
+    if not header_matches:
+        raise ValueError('DN形式のレースヘッダーが見つかりませんでした。ファイル形式を確認してください。')
+
+    races = []
+    for i, m in enumerate(header_matches):
+        start = m.end()
+        end = header_matches[i + 1].start() if i + 1 < len(header_matches) else len(text)
+        body = text[start:end]
+
+        year, month, day, kai, venue, nichi, time_ = m.groups()
+        rno_m = DN_RACE_NO_RE.search(body)
+        race_no = int(zen2han(rno_m.group(1))) if rno_m else None
+
+        cd_m = DN_CLASS_DIST_RE.search(body)
+        if cd_m:
+            race_name_raw, track_jp, dist, n_horses = cd_m.groups()
+            track = 'T' if track_jp == '芝' else 'D'
+            dist = int(dist)
+            n_horses = int(n_horses)
+        else:
+            race_name_raw, track, dist, n_horses = '', 'T', None, None
+
+        entries = DN_ENTRY_RE.findall(body)
+        races.append({
+            'venue': venue, 'race_no': race_no, 'race_name': race_name_raw.strip(),
+            'race_class': classify_race_class(race_name_raw),
+            'track': track, 'dist': dist, 'n_horses': n_horses,
+            'n_entries_parsed': len(entries),
+            'entries': [
+                {'waku': e[0], 'umaban': e[1], 'horse': e[2], 'sex': e[3], 'age': e[4],
+                 'jockey': e[5], 'weight': e[6]}
+                for e in entries
+            ],
+        })
+    return races
+
+
 
 
 st.title('🏇 LPI v11 競馬予想ツール')
@@ -2173,15 +2309,15 @@ with tab_daily:
 
     with st.expander('📅 1日厳選レースを使う', expanded=False):
 
-        st.markdown('**① 出走表CSVをアップロード**')
+        st.markdown('**① 過去走データファイルをアップロード**')
         col_a, col_b = st.columns(2)
         with col_a:
             daily_base_file = st.file_uploader(
                 '基準テーブル用CSV（平場水準のデータを推奨。重賞級のみだと較正がズレることを確認済み）',
                 type='csv', key='daily_base')
         with col_b:
-            daily_multi_file = st.file_uploader(
-                'この日の全レース出走表CSV（枠番区切り形式）', type='csv', key='daily_multi')
+            daily_history_file = st.file_uploader(
+                '過去走データファイル（33列・ヘッダーなし形式）', type=['csv', 'txt'], key='daily_history')
 
         col_c, col_d = st.columns(2)
         with col_c:
@@ -2206,63 +2342,62 @@ with tab_daily:
 
         st.markdown('---')
         st.markdown(
-            '**② レース情報CSVをアップロード**　'
-            '出走表変換ノートブック（v5）が出力する`レース情報一覧.csv`をそのままアップしてください'
-            '（会場・R番号・クラス・距離・トラック・頭数が入っています。番組表の手コピペは不要です）。'
+            '**② DN形式ファイルをアップロード**　'
+            'JRA-VAN等から出力した、当日の全レース分の出馬表テキスト（DN形式・.TXT）をそのままアップしてください。'
+            '会場・R番号・クラス・距離・トラック・頭数・出走馬（枠番・馬番・馬名・性別・年齢・騎手・斤量）を'
+            'このファイル1つから自動抽出します。番組表の手コピペや、別途出走表CSVを作る必要はありません。'
         )
-        daily_meta_file = st.file_uploader(
-            'レース情報一覧CSV', type='csv', key='daily_meta')
+        daily_dn_file = st.file_uploader(
+            'DN形式ファイル（当日の全レース、.TXT）', type=['txt', 'csv'], key='daily_dn')
 
-        split_btn = st.button('③ CSV分割 + 自動対応づけ', key='daily_split')
+        split_btn = st.button('③ 解析 + 自動対応づけ', key='daily_split')
 
         if split_btn:
-            if not daily_multi_file:
-                st.error('この日の全レース出走表CSVをアップロードしてください。')
-            elif not daily_meta_file:
-                st.error('レース情報一覧CSVをアップロードしてください。')
+            if not daily_history_file:
+                st.error('過去走データファイルをアップロードしてください。')
+            elif not daily_dn_file:
+                st.error('DN形式ファイルをアップロードしてください。')
             else:
                 try:
-                    races = split_multi_race_csv(daily_multi_file.read())
-                    daily_multi_file.seek(0)
+                    hist_valid = load_history_data(daily_history_file.read())
+                    daily_history_file.seek(0)
                 except Exception as e:
-                    st.error(f'CSVの分割に失敗しました: {e}')
-                    races = []
+                    st.error(f'過去走データの読み込みに失敗しました: {e}')
+                    hist_valid = None
 
                 try:
-                    meta_df_raw = pd.read_csv(daily_meta_file, encoding='cp932')
-                    daily_meta_file.seek(0)
-                except Exception:
-                    daily_meta_file.seek(0)
-                    meta_df_raw = pd.read_csv(daily_meta_file, encoding='utf-8-sig')
+                    dn_races = parse_dn_file(daily_dn_file.read())
+                    daily_dn_file.seek(0)
+                except Exception as e:
+                    st.error(f'DN形式ファイルの解析に失敗しました: {e}')
+                    dn_races = []
 
-                if not races:
-                    st.warning('CSVからレースを検出できませんでした。')
-                elif len(meta_df_raw) == 0:
-                    st.warning('レース情報一覧CSVが空です。')
+                if hist_valid is None or not dn_races:
+                    st.warning('解析できませんでした。ファイル形式を確認してください。')
                 else:
-                    n_races, n_meta = len(races), len(meta_df_raw)
-                    if n_races == n_meta:
-                        st.success(f'✅ CSV{n_races}レース分 と レース情報{n_meta}件が一致しました。')
+                    n_mismatch = sum(1 for r in dn_races if r['n_entries_parsed'] != r['n_horses'])
+                    if n_mismatch == 0:
+                        st.success(f'✅ {len(dn_races)}レース、全て頭数と出走馬数が一致しました。')
                     else:
                         st.warning(
-                            f'⚠️ CSVは{n_races}レース分ですが、レース情報一覧は{n_meta}件でした。'
-                            '対応がズレている可能性があるので、下の表で必ず確認してください。'
+                            f'⚠️ {n_mismatch}レースで頭数と解析できた出走馬数が一致しませんでした。'
+                            '下の表で頭数を確認してください（DN形式の想定外パターンの可能性があります）。'
                         )
 
                     mapping_rows = []
-                    for i, (block_no, block) in enumerate(races):
-                        meta_row = meta_df_raw.iloc[i] if i < len(meta_df_raw) else None
+                    for i, r in enumerate(dn_races, start=1):
                         mapping_rows.append({
-                            'block_no': block_no,
-                            '頭数': len(block),
-                            '会場': meta_row['会場'] if meta_row is not None else None,
-                            'R': meta_row['R'] if meta_row is not None else None,
-                            '距離': meta_row['距離'] if meta_row is not None else None,
-                            'トラック': meta_row['トラック'] if meta_row is not None else 'T',
-                            'クラス': meta_row['クラス'] if meta_row is not None else '不明',
+                            'block_no': i,
+                            '頭数': r['n_entries_parsed'],
+                            '会場': r['venue'] if r['venue'] in VENUE_NAMES else None,
+                            'R': r['race_no'],
+                            '距離': r['dist'],
+                            'トラック': r['track'],
+                            'クラス': r['race_class'],
                         })
 
-                    st.session_state['daily_races'] = races
+                    st.session_state['daily_dn_races'] = dn_races
+                    st.session_state['daily_hist_valid'] = hist_valid
                     st.session_state['daily_mapping_df'] = pd.DataFrame(mapping_rows)
 
         if 'daily_mapping_df' in st.session_state:
@@ -2290,10 +2425,9 @@ with tab_daily:
 
             # フィルター条件に該当するレース数を事前表示
             if use_race_filter:
-                allowed_cls = CLASS_1PLUS if not filter_exclude_maiden_only else (CLASS_1PLUS | {'不明'})
-                # ↑ filter_exclude_maiden_onlyの時は「未勝利・新馬だけ除外」相当にする
+                allowed_cls = {'1勝クラス','2勝クラス','3勝クラス','L','オープン特別等','G1','G2','G3'}
                 if filter_exclude_maiden_only:
-                    allowed_cls = {'1勝クラス','2勝クラス','3勝クラス','L','オープン特別等','G1','G2','G3','不明'}
+                    allowed_cls = allowed_cls | {'不明'}
                 n_pass = 0
                 for _, row in edited_map.iterrows():
                     venue_ex = {'東京'} if filter_exclude_tokyo else set()
@@ -2315,15 +2449,16 @@ with tab_daily:
                     with st.spinner('基準テーブルを構築中...'):
                         d_base_dict, d_稍重_dict, d_race_base_dict = build_base_table(daily_base_file.read())
 
-                    races = st.session_state['daily_races']
+                    dn_races = st.session_state['daily_dn_races']
+                    hist_valid = st.session_state['daily_hist_valid']
                     map_by_block = {row['block_no']: row for _, row in edited_map.iterrows()}
 
                     race_lpi_results = []
                     progress = st.progress(0)
-                    for i, (block_no, block) in enumerate(races):
-                        m = map_by_block.get(block_no)
-                        if m is None:
-                            progress.progress((i + 1) / len(races))
+                    for i, race in enumerate(dn_races, start=1):
+                        m = map_by_block.get(i)
+                        if m is None or len(race['entries']) < 2:
+                            progress.progress(i / len(dn_races))
                             continue
 
                         r_dist  = float(m['距離'])
@@ -2333,7 +2468,15 @@ with tab_daily:
                         r_class = m['クラス']
 
                         try:
-                            csv_bytes = block.to_csv(index=False).encode('cp932', errors='replace')
+                            # 過去走データと突き合わせて、その場でWALK_DEFS横持ちの出走表を作る
+                            out_rows = []
+                            for e in race['entries']:
+                                row = {'枠番': e['waku'], '馬名S': e['horse'],
+                                       '性別': e['sex'], '年齢': e['age']}
+                                row.update(build_walk_columns_from_history(hist_valid, e['horse']))
+                                out_rows.append(row)
+                            entry_df = pd.DataFrame(out_rows)
+                            csv_bytes = entry_df.to_csv(index=False).encode('cp932', errors='replace')
 
                             styles = precompute_running_styles(csv_bytes)
                             pace = get_pace_prediction(r_dist, r_venue, styles.get('nige', 0), styles.get('senkou', 0))
@@ -2350,14 +2493,14 @@ with tab_daily:
 
                             if len(ranked) >= 2:
                                 race_lpi_results.append({
-                                    'block_no': block_no, 'race_label': f'{r_venue}{r_no}R' if r_no else r_venue,
+                                    'block_no': i, 'race_label': f'{r_venue}{r_no}R' if r_no else r_venue,
                                     'n_horses': len(ranked), 'ranked': ranked,
                                     'dist': r_dist, 'track': r_track, 'venue': r_venue,
                                     'class': r_class,
                                 })
                         except Exception as e:
-                            st.caption(f'block{block_no}: 計算スキップ（{e}）')
-                        progress.progress((i + 1) / len(races))
+                            st.caption(f'block{i}: 計算スキップ（{e}）')
+                        progress.progress(i / len(dn_races))
 
                     if not race_lpi_results:
                         st.warning('LPIを計算できたレースがありませんでした。')
