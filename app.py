@@ -2206,27 +2206,20 @@ with tab_daily:
 
         st.markdown('---')
         st.markdown(
-            '**② 番組表をコピペ**　'
-            '[JRA開催日程ページ](https://www.jra.go.jp/keiba/calendar/) '
-            'でその日を開き、会場ごとの表（会場名〜R番号〜クラス名〜距離〜芝ダ）をそのままコピー＆ペーストしてください。'
-            '複数会場ある場合は両方まとめて貼ってOKです。'
+            '**② レース情報CSVをアップロード**　'
+            '出走表変換ノートブック（v5）が出力する`レース情報一覧.csv`をそのままアップしてください'
+            '（会場・R番号・クラス・距離・トラック・頭数が入っています。番組表の手コピペは不要です）。'
         )
-        program_text = st.text_area(
-            '番組表テキスト', height=200, key='daily_program_text',
-            placeholder='JRA開催日程ページの表をそのままコピペ（例）:\n'
-                        '3回東京2日\nレース\n番号\nレース名・条件\t発走時刻\n'
-                        '1\nレース\n3歳未勝利\n1,400（ダ）（牝）\n10時05分\n'
-                        '2\nレース\n3歳未勝利\n2,100（ダ）\n10時35分\n...'
-        )
-        target_track_filter = st.radio('抽出するトラック', ['芝', 'ダート'], horizontal=True, key='daily_track_filter')
+        daily_meta_file = st.file_uploader(
+            'レース情報一覧CSV', type='csv', key='daily_meta')
 
-        split_btn = st.button('③ CSV分割 + 番組表パース + 自動対応づけ', key='daily_split')
+        split_btn = st.button('③ CSV分割 + 自動対応づけ', key='daily_split')
 
         if split_btn:
             if not daily_multi_file:
                 st.error('この日の全レース出走表CSVをアップロードしてください。')
-            elif not program_text.strip():
-                st.error('番組表テキストを貼り付けてください。')
+            elif not daily_meta_file:
+                st.error('レース情報一覧CSVをアップロードしてください。')
             else:
                 try:
                     races = split_multi_race_csv(daily_multi_file.read())
@@ -2235,38 +2228,38 @@ with tab_daily:
                     st.error(f'CSVの分割に失敗しました: {e}')
                     races = []
 
-                program = parse_jra_program(program_text)
-                track_code = 'T' if target_track_filter == '芝' else 'D'
-                program_filtered = [p for p in program if p['track'] == track_code]
-                program_filtered.sort(key=lambda p: (VENUE_NAMES.index(p['venue'])
-                                                       if p['venue'] in VENUE_NAMES else 99,
-                                                       p['race_no']))
+                try:
+                    meta_df_raw = pd.read_csv(daily_meta_file, encoding='cp932')
+                    daily_meta_file.seek(0)
+                except Exception:
+                    daily_meta_file.seek(0)
+                    meta_df_raw = pd.read_csv(daily_meta_file, encoding='utf-8-sig')
 
                 if not races:
                     st.warning('CSVからレースを検出できませんでした。')
-                elif not program_filtered:
-                    st.warning('番組表から対象トラックのレースを検出できませんでした。テキストの形式を確認してください。')
+                elif len(meta_df_raw) == 0:
+                    st.warning('レース情報一覧CSVが空です。')
                 else:
-                    n_races, n_prog = len(races), len(program_filtered)
-                    if n_races == n_prog:
-                        st.success(f'✅ CSV{n_races}レース分 と 番組表の{target_track_filter}レース{n_prog}件が一致しました。')
+                    n_races, n_meta = len(races), len(meta_df_raw)
+                    if n_races == n_meta:
+                        st.success(f'✅ CSV{n_races}レース分 と レース情報{n_meta}件が一致しました。')
                     else:
                         st.warning(
-                            f'⚠️ CSVは{n_races}レース分ですが、番組表から拾えた{target_track_filter}レースは{n_prog}件でした。'
+                            f'⚠️ CSVは{n_races}レース分ですが、レース情報一覧は{n_meta}件でした。'
                             '対応がズレている可能性があるので、下の表で必ず確認してください。'
                         )
 
                     mapping_rows = []
                     for i, (block_no, block) in enumerate(races):
-                        p = program_filtered[i] if i < len(program_filtered) else None
+                        meta_row = meta_df_raw.iloc[i] if i < len(meta_df_raw) else None
                         mapping_rows.append({
                             'block_no': block_no,
                             '頭数': len(block),
-                            '会場': p['venue'] if p else None,
-                            'R': p['race_no'] if p else None,
-                            '距離': p['dist'] if p else None,
-                            'トラック': track_code,
-                            'クラス': p['race_class'] if p else '不明',
+                            '会場': meta_row['会場'] if meta_row is not None else None,
+                            'R': meta_row['R'] if meta_row is not None else None,
+                            '距離': meta_row['距離'] if meta_row is not None else None,
+                            'トラック': meta_row['トラック'] if meta_row is not None else 'T',
+                            'クラス': meta_row['クラス'] if meta_row is not None else '不明',
                         })
 
                     st.session_state['daily_races'] = races
