@@ -2651,6 +2651,12 @@ with tab_daily:
                         )
 
                     st.subheader(f'🏆 本日の厳選{len(selected)}レース（gap = LPI1位と2位のスコア差）')
+                    if not use_odds_filter or daily_odds_map is None:
+                        st.warning(
+                            '⚠️ **購入前に必ず確認：軸×相手1位の単勝オッズの積が「40〜120」に収まっているか、'
+                            'オッズ表で確認してください。**（2020-2026年重賞データの検証で、このゾーンだと'
+                            '馬単回収率127%→303%まで改善した実績あり。範囲外の時は見送りも検討してください。）'
+                        )
                     for s in selected:
                         ranked = s['ranked']
                         axis = ranked[0]
@@ -2659,6 +2665,16 @@ with tab_daily:
                             f"**{s['race_label']}**　{int(s['dist'])}m {s['track']}　{s['class']}　"
                             f"gap = **{s['gap']:.1f}**　（出走{s['n_horses']}頭）"
                         )
+                        if use_odds_filter and daily_odds_map is not None:
+                            o1 = daily_odds_map.get(axis['horse'])
+                            o2 = daily_odds_map.get(partners[0]['horse']) if partners else None
+                            if o1 is not None and o2 is not None:
+                                prod = o1 * o2
+                                in_zone = filter_odds_lo <= prod <= filter_odds_hi
+                                mark = '✅お得ゾーン内' if in_zone else '⚠️お得ゾーン外'
+                                st.caption(f'オッズ積(軸×相手1位) = {o1:.1f}×{o2:.1f} = {prod:.1f}　{mark}（目安:{filter_odds_lo}〜{filter_odds_hi}）')
+                            else:
+                                st.caption('⚠️ オッズ積の判定に必要なオッズが見つかりませんでした。手動で確認してください。')
                         rows = [{
                             'LPI順位': 1, '馬名': axis['horse'],
                             'LPI': axis['avg_venue_lpi'], '役割': '🎯 軸（1着固定）',
