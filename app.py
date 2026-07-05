@@ -1343,657 +1343,136 @@ def plot_ranking(results, race_name, target_venue):
 # ============================================================
 # Streamlit UI
 # ============================================================
-st.title('🏇 LPI v11 競馬予想ツール')
-st.caption('LPI (ラップ強さ指数) v11 — 展開ボーナス対応版。2024-2025年バックテスト済み設定を既定値として採用。')
+# ============================================================
+# 1日厳選レース機能 v5 用の関数定義
+# (split_multi_race_csv, parse_jra_program はv4由来、
+#  classify_race_class/passes_race_filter/select_top_gap_races はv5で複合フィルター対応)
+# ============================================================
 
-# ---- サイドバー ----
-with st.sidebar:
-    st.header('⚙️ 設定')
-
-    st.subheader('① 基準テーブル用CSV')
-    st.caption('⚠️ 平場（未勝利〜3勝クラス）水準のデータ推奨。重賞のみだと較正がズレます。')
-    base_file = st.file_uploader(
-        '2020〜2025年など、複数年分の平場結果CSVをアップ',
-        type='csv', key='base')
-    if base_file:
-        st.success(f'{base_file.name} 読み込み済み')
-
-    st.subheader('② 出走表CSV')
-    entry_file = st.file_uploader(
-        '予想するレースの出走表CSVをアップ',
-        type='csv', key='entry')
-
-    st.subheader('③ レース設定')
-    race_name    = st.text_input('レース名', value='2026 レース名')
-    target_venue = st.selectbox(
-        '競馬場',
-        ['東京','中山','京都','阪神','中京','新潟','福島','小倉','札幌','函館'])
-    target_track = st.radio('トラック', ['T（芝）','D（ダート）'])
-    track_code   = 'T' if target_track.startswith('T') else 'D'
-    bonus_strength = st.slider(
-        '競馬場ボーナス強度', 0.0, 0.30, 0.15, 0.05,
-        help='0=ボーナスなし / 0.15=標準(検証済み・推奨) / 0.30=強め。'
-             '検証済み: このボーナスを外すと馬単回収率が大幅に悪化します。')
-
-    st.subheader('④ ペース予測（自動判定・上書き可）')
-    race_dist = st.number_input('レース距離（m）', min_value=1000, max_value=3600, value=1600, step=200)
-
-    auto_pace = st.checkbox('出走馬の脚質から自動でペースを判定する', value=True,
-                             help='検証済み(展開ボーナス): 各馬の過去走地点差から脚質を自動判定し、'
-                                  'ペース予測・展開適合ボーナスに反映します。')
-    if not auto_pace:
-        nige_count   = st.number_input('逃げ馬頭数', min_value=0, max_value=10, value=0, step=1)
-        senkou_count = st.number_input('先行馬頭数', min_value=0, max_value=16, value=0, step=1)
-    else:
-        nige_count, senkou_count = 0, 0  # 自動判定時は実行時に上書きする
-
-    use_pace_bonus = st.checkbox('展開適合ボーナスをLPIに反映する', value=True,
-                                  help='検証済み: 有効にすると馬単回収率70.8%→82.3%(2024-2025年バックテスト)')
-    pace_bonus_strength_input = st.slider('展開ボーナスの強さ', 0.0, 6.0, 3.0, 0.5,
-                                           disabled=not use_pace_bonus)
-
-    st.markdown('**ペース直接指定（任意・自動判定を上書き）**')
-    manual_pace = st.radio(
-        'ペース帯を選択',
-        options=['自動推定（コース統計/脚質判定から）', '🔵 H（ハイ）', '🟢 M（ミドル）', '🟠 S（スロー）'],
-        index=0,
-        horizontal=False,
-    )
-    if '自動' in manual_pace:
-        manual_rpci = 0.0
-    elif 'H' in manual_pace:
-        manual_rpci = 45.0
-    elif 'M' in manual_pace:
-        manual_rpci = 51.0
-    else:
-        manual_rpci = 57.0
-
-    st.subheader('⑤ 好走ボーナス（既定オフ・検証済み）')
-    enable_g1_streak_bonus = st.checkbox(
-        'G1好走・連続好走ボーナスを使う', value=False,
-        help='検証済み: オフの方が馬連回収率が2024-2025年両年で一貫して良い結果でした'
-             '(62.8%→65.6%, 94.2%→102.7%)。会場適性ボーナスとは別物です。'
-    )
-
-    st.subheader('⑥ PCI追走スコア（任意）')
-    use_pci_cs = st.checkbox(
-        '逃げ馬ペースへの追走能力を評価する',
-        value=False,
-    )
-    if use_pci_cs:
-        target_front_1f = st.number_input(
-            '逃げ馬の想定前半1F（秒）',
-            min_value=10.5, max_value=13.5, value=11.9, step=0.05,
-        )
-    else:
-        target_front_1f = None
-
-    st.subheader('⑦ クッション値（任意）')
-    use_cushion = st.checkbox('クッション値で基準上がりを補正する', value=False)
-    if use_cushion:
-        cushion_val = st.number_input('クッション値', min_value=5.0, max_value=14.0, value=9.0, step=0.1)
-        cushion_adj = round((9.0 - cushion_val) * 0.15, 3)
-        if cushion_adj > 0:
-            st.caption(f'クッション値{cushion_val:.1f} → 基準上がり{cushion_adj:+.2f}秒（遅い馬場）')
-        elif cushion_adj < 0:
-            st.caption(f'クッション値{cushion_val:.1f} → 基準上がり{cushion_adj:+.2f}秒（速い馬場）')
-        else:
-            st.caption('クッション値9.0 → 補正なし（標準）')
-    else:
-        cushion_val  = 9.0
-        cushion_adj  = 0.0
-
-    run_btn = st.button('🔍 LPI計算実行', type='primary', use_container_width=True)
-
-# ---- メインエリア ----
-if not base_file:
-    st.info('← サイドバーから基準テーブル用CSVをアップしてください（平場水準のデータ推奨）')
-    st.stop()
-
-if not entry_file:
-    st.info('← サイドバーから出走表CSVをアップしてください')
-    st.stop()
-
-if run_btn or (base_file and entry_file):
-    entry_bytes_for_pace = entry_file.read()
-    entry_file.seek(0)
-
-    # ---- ペース予測 ----
-    if manual_rpci > 0:
-        _mr = manual_rpci
-        if _mr <= 47:
-            _label, _lamp = 'ハイペース（直接指定）', '🔵'
-            _elem_adv = ['基礎スピード・パワー', 'パワー・ロンスパ']
-            _comment  = 'H（ハイ）指定 — 前半速く先行馬が消耗。基礎スピード型・差し馬有利'
-        elif _mr >= 54:
-            _label, _lamp = 'スローペース（直接指定）', '🟠'
-            _elem_adv = ['ギアチェンジ', 'ロンスパ・ギアチェンジ']
-            _comment  = 'S（スロー）指定 — 上がり勝負。GC型有利、先行馬の前残りも警戒'
-        else:
-            _label, _lamp = 'ミドルペース（直接指定）', '🟢'
-            _elem_adv = []
-            _comment  = 'M（ミドル）指定 — 平均的なペース。どちらも起こりうる'
-        pace = dict(pred_rpci=_mr, base_rpci=_mr, std=0.0,
-                    slow_pct=100 if _mr>=54 else 0,
-                    fast_pct=100 if _mr<=47 else 0,
-                    label=_label, lamp=_lamp,
-                    elem_adv=_elem_adv, comment=_comment)
-        auto_style_info = None
-    elif auto_pace:
-        # 展開ボーナス: 2パス構成(1パス目=脚質自動判定)
+def split_multi_race_csv(file_bytes):
+    """
+    「枠番」ヘッダー行が複数回出現する、1日分の全レースが縦に連結された
+    CSVを、レースごとのDataFrameに分割する。
+    """
+    for enc in ['cp932', 'shift_jis', 'utf-8-sig', 'utf-8']:
         try:
-            auto_style_info = precompute_running_styles(entry_bytes_for_pace)
-            pace = get_pace_prediction(race_dist, target_venue,
-                                        auto_style_info['nige'], auto_style_info['senkou'])
-        except Exception as e:
-            st.warning(f'脚質自動判定に失敗したため手動値(0,0)で計算します: {e}')
-            auto_style_info = None
-            pace = get_pace_prediction(race_dist, target_venue, 0, 0)
+            df_raw = pd.read_csv(io.BytesIO(file_bytes), encoding=enc)
+            break
+        except Exception:
+            continue
     else:
-        pace = get_pace_prediction(race_dist, target_venue, nige_count, senkou_count)
-        auto_style_info = None
+        raise ValueError('文字コードを判定できませんでした')
 
-    with st.spinner('基準テーブルを構築中...'):
-        base_dict, 稍重_dict, race_base_dict = build_base_table(base_file.read())
-        base_file.seek(0)  # 再読み込みのためリセット
+    if '枠番' not in df_raw.columns:
+        raise ValueError('「枠番」列が見つかりません。レース区切りを検出できる形式のCSVをアップロードしてください。')
 
-    with st.spinner('LPI計算中...'):
-        results = calc_lpi(
-            entry_file.read(),
-            base_dict, 稍重_dict,
-            target_track=track_code,
-            target_venue=target_venue,
-            bonus_strength=bonus_strength,
-            pace_pred_rpci=pace['pred_rpci'],
-            race_base_dict=race_base_dict,
-            target_race_name=race_name,
-            target_front_1f_input=target_front_1f if use_pci_cs else None,
-            cushion_correction_input=cushion_adj if use_cushion else 0.0,
-            pace_elem_adv=pace['elem_adv'] if use_pace_bonus else None,
-            pace_bonus_strength=pace_bonus_strength_input if use_pace_bonus else 0.0,
-            disable_g1_streak_bonus=not enable_g1_streak_bonus,
-            target_dist=float(race_dist),
+    header_rows = df_raw[df_raw['枠番'].astype(str) == '枠番'].index.tolist()
+    boundaries = [0] + header_rows + [len(df_raw)]
+
+    races = []
+    block_no = 1
+    for i in range(len(boundaries) - 1):
+        start, end = boundaries[i], boundaries[i + 1]
+        block = df_raw.iloc[start:end].copy()
+        if len(block) > 0 and str(block.iloc[0]['枠番']) == '枠番':
+            block = block.iloc[1:].copy()
+        block = block.dropna(subset=['馬名S'])
+        block = block[block['馬名S'].astype(str) != '馬名S'].reset_index(drop=True)
+        if len(block) < 2:
+            continue
+        races.append((block_no, block))
+        block_no += 1
+    return races
+
+
+# ============================================================
+# JRA番組表テキストのパース(クラス名抽出を追加)
+# ============================================================
+VENUE_NAMES = ['東京', '中山', '京都', '阪神', '新潟', '中京', '福島', '小倉', '札幌', '函館']
+
+DIST_TRACK_RE = re.compile(
+    r'([\d,，]{3,5})\s*[（(]\s*(芝|ダート|ダ)(?:[・][^）)]*)?\s*[)）]'
+)
+
+def classify_race_class(text):
+    """番組表のクラス名テキストから大まかなクラス区分を判定する。(v5版が下で上書きするので参照のみ)"""
+    s = str(text)
+    if '新馬' in s: return '新馬'
+    if '未勝利' in s: return '未勝利'
+    if '1勝' in s or '１勝' in s: return '1勝クラス'
+    if '2勝' in s or '２勝' in s: return '2勝クラス'
+    if '3勝' in s or '３勝' in s: return '3勝クラス'
+    if re.search(r'G[1-3]', s): return re.search(r'G[1-3]', s).group()
+    if 'オープン' in s or 'Ｌ' in s or '(L)' in s: return 'オープン特別等'
+    return '不明'
+
+def parse_jra_program(text):
+    """
+    JRA公式サイトの「開催日程（番組表）」ページからブラウザでそのままコピペした
+    テキストを解析し、会場ごとのレース一覧（R番号・距離・トラック・クラス）を返す。
+
+    実際のコピペ結果は「レース番号」「レース」「クラス名」「距離（芝/ダ）」「発走時刻」
+    がそれぞれ別行になる(表のセルが縦に展開される)ため、行単位ではなく
+    「数字だけの行の直後に'レース'という行がある」＝レコード開始、として検出し、
+    そこから数行以内にある距離パターンを探す方式にしている。
+    クラス名は、レコード開始行から距離パターンが見つかった行までの間の
+    テキストを結合して判定する。
+
+    Returns: list of dict [{'venue','race_no','dist','track','race_class'}], 出現順
+    """
+    lines = [l.strip() for l in text.splitlines()]
+    results = []
+    current_venue = None
+    i, n = 0, len(lines)
+
+    while i < n:
+        line = lines[i]
+        if not line:
+            i += 1
+            continue
+
+        is_record_start = (
+            bool(re.fullmatch(r'\d{1,2}', line))
+            and i + 1 < n
+            and lines[i + 1].strip() == 'レース'
         )
+        if not is_record_start:
+            for v in VENUE_NAMES:
+                if v in line:
+                    current_venue = v
+                    break
+            i += 1
+            continue
 
-    if not results:
-        st.error('計算できるデータがありませんでした。CSVの形式を確認してください。')
-        st.stop()
-
-    st.success(f'✅ {len(results)}頭 計算完了')
-
-    if auto_style_info:
-        st.caption(
-            f"🐎 脚質自動判定結果: 逃げ{auto_style_info['nige']}頭 / 先行{auto_style_info['senkou']}頭 / "
-            f"中団{auto_style_info['chudan']}頭 / 後方{auto_style_info['oikomi']}頭 / 不明{auto_style_info['fumei']}頭"
-        )
-
-    # ---- ペース予測バナー ----
-    lamp_color  = {'🟠': '#E65100', '🔵': '#0D47A1', '⚪': '#424242'}
-    border_color = {'🟠': '#FF6D00', '🔵': '#1565C0', '⚪': '#616161'}
-    bc  = lamp_color.get(pace['lamp'], '#424242')
-    brd = border_color.get(pace['lamp'], '#616161')
-
-    adv_html = ''
-    if pace['elem_adv']:
-        adv_html = '  有利な要素型: **' + ' / '.join(pace['elem_adv']) + '**'
-
-    cushion_html = ''
-    if use_cushion and cushion_adj != 0.0:
-        c_label = '軟らかめ' if cushion_val < 8 else ('やや軟らかめ' if cushion_val < 9 else ('やや硬め' if cushion_val < 11 else '硬め'))
-        cushion_html = f'　🌿 クッション値{cushion_val:.1f}({c_label}) → 基準上がり{cushion_adj:+.2f}秒補正'
-
-    st.markdown(
-        f"""<div style="background:{bc};border:2px solid {brd};border-radius:8px;
-        padding:12px 16px;margin:8px 0;font-size:13px;line-height:1.8;color:#FFFFFF;font-weight:500">
-        <b>{pace['lamp']} ペース予測: {pace['label']}</b>　
-        予測RPCI <b>{pace['pred_rpci']:.1f}</b>（基準{pace['base_rpci']:.1f}±{pace['std']:.1f}）<br>
-        スロー率 <b>{pace['slow_pct']}%</b>　ハイ率 <b>{pace['fast_pct']}%</b><br>
-        {pace['comment']}{adv_html}{cushion_html}
-        </div>""",
-        unsafe_allow_html=True
-    )
-
-    # ---- レース環境スコア（堅実軸）バナー ----
-    _race_grade = extract_grade(race_name)
-    race_env_score = calc_race_env_score(pace['pred_rpci'], race_dist, _race_grade, target_venue)
-    if race_env_score <= 1:
-        env_label = '🟢 堅実軸が機能しやすいレース'
-        env_detail = ('少頭数寄り・Sペース寄り・マイル以上・主要場グレード戦の傾向'
-                       'がそろっており、過去データではLPI上位馬の単勝回収率が高い（複勝率29.5%・回収率98.4%）。')
-        env_color, env_border = '#1B5E20', '#2E7D32'
-    elif race_env_score >= 3:
-        env_label = '🔴 紛れが起きやすいレース（LPI上位でも過信注意）'
-        env_detail = ('短距離・Hペース・G3・小場開催の条件が重なっており、'
-                       '過去データではLPI上位馬でも単勝回収率が下がる傾向（複勝率は同水準・回収率66.1%）。'
-                       'LPI下位の馬も含めて広めに見る方が無難。')
-        env_color, env_border = '#B71C1C', '#C62828'
-    else:
-        env_label = '🟡 標準的な紛れやすさのレース'
-        env_detail = '極端な傾向はない。通常通りLPI評価を参考にする。'
-        env_color, env_border = '#5D4037', '#6D4C41'
-
-    st.markdown(
-        f"""<div style="background:{env_color};border:2px solid {env_border};border-radius:8px;
-        padding:10px 16px;margin:4px 0 8px 0;font-size:12.5px;line-height:1.7;color:#FFFFFF;font-weight:500">
-        <b>{env_label}</b>（環境スコア{race_env_score}/4）<br>
-        {env_detail}
-        </div>""",
-        unsafe_allow_html=True
-    )
-
-    # ---- タブで表示 ----
-    tab1, tab2, tab3, tab4 = st.tabs(['📊 ランキング表', '📈 グラフ', '🔍 過去走詳細', '🎲 シミュレーション'])
-
-    # ===== タブ1: ランキング表 =====
-    with tab1:
-        st.subheader(f'{race_name}  LPI v11 ランキング')
-
-        pci_cs_map = {}
-        if use_pci_cs and target_front_1f:
-            for r in results:
-                cs = calc_pci_cs(r.get('pci_cs_runs', []), target_front_1f)
-                pci_cs_map[r['horse']] = cs
-
-        rows = []
-        for i, r in enumerate(results):
-            bonus_runs = [rn for rn in r['runs'] if rn.get('hb', 0) > 0]
-            bonus_str  = ' / '.join(
-                [f"{rn.get('race','-')}({rn.get('hb_r','')})" for rn in bonus_runs])
-            g1_bonus_str = (f"+{r['g1_lpi_bonus']:.1f}({r['g1_bonus_detail']})"
-                           if r.get('g1_lpi_bonus', 0) > 0 else '-')
-            past  = [rn for rn in r['runs']
-                     if not rn.get('excluded_baba') and not rn.get('excluded_track')][:5]
-            plpi  = [round(rn['lpi'], 1) for rn in past]
-            while len(plpi) < 5: plpi.append('-')
-
-            delta = r.get('venue_delta', 0.0)
-            pace_match = r['dom_elem'] in pace['elem_adv'] if pace['elem_adv'] else None
-            pace_mark = '◎' if pace_match else ('△' if pace_match is False else '-')
-
-            if r.get('agari_pred'):
-                ap = r['agari_pred']
-                z_val   = round(ap['pred_z'], 3)
-                grade   = ap['grade_label']
-                conf    = ap['confidence']
-                n_valid = ap['n_valid']
-                n_disc  = ap.get('n_discounted', 0)
-                hg_only = '★G1/G2限定' if ap.get('comment','') and 'G1/G2走' in ap.get('comment','') else ''
-                matsu_str = f'{grade} {conf}  Z={z_val:+.3f}({n_valid}走{hg_only})'
-            else:
-                matsu_str = '-'; z_val = '-'
-
-            pci_str = (pci_cs_map[r['horse']]['judge'] + ' ' +
-                       str(pci_cs_map[r['horse']]['score'])
-                       + '（' + pci_cs_map[r['horse']]['detail'][:15] + '）')                        if r['horse'] in pci_cs_map else '-'
-
-            if r.get('pos_pred'):
-                pp = r['pos_pred']
-                avg_gap = (sum(pp['past_gaps'])/len(pp['past_gaps'])
-                           if pp['past_gaps'] else pp['pred_gap'])
-                pos_str = (f"{pp['icon']}{pp['zone_name']} {pp['confidence']}"
-                           f"  予測{pp['pred_gap']:.1f}秒（平均{avg_gap:.1f}秒）")
-            else:
-                pos_str = '-'
-
-            pp = r.get('pos_pred')
-            if pp and pp.get('past_gaps'):
-                gaps = pp['past_gaps']
-                avg_gap = sum(gaps)/len(gaps)
-                gap_label = ('🏇逃げ' if avg_gap<=0.1 else
-                             '🔵先行' if avg_gap<=0.6 else
-                             '🟡中団' if avg_gap<=1.2 else '🔴後方')
-                past_pos_str = f'{gap_label} 平均{avg_gap:.1f}秒({len(gaps)}走)'
-            else:
-                past_pos_str = '-'
-
-            if race_env_score <= 1 and (i + 1) <= 5:
-                kentaku_str = '🟢堅実軸'
-            elif race_env_score >= 3 and (i + 1) <= 5:
-                kentaku_str = '🔴過信注意'
-            else:
-                kentaku_str = '-'
-
-            rows.append({
-                '順位':           i + 1,
-                '馬名':           r['horse'],
-                f'LPI[{target_venue}補正]': r['avg_venue_lpi'],
-                'LPI基本':        r['avg_lpi'],
-                '展開適合':       pace_mark,
-                'G1好走B':        g1_bonus_str,
-                '要素型':         r['dom_elem'],
-                '係数':           r['coef'],
-                '有効/全走':      f"{r['n_valid']}/{r['n_total']}",
-                '1走前':          plpi[0],
-                '2走前':          plpi[1],
-                '3走前':          plpi[2],
-                '4走前':          plpi[3],
-                '5走前':          plpi[4],
-                'PCI追走':        pci_str,
-                '末脚能力':       matsu_str,
-                '過去ポジション':  past_pos_str,
-                '不利ボーナス':   bonus_str,
-                '堅実軸':         kentaku_str,
-            })
-
-        result_df = pd.DataFrame(rows)
-        lpi_col   = f'LPI[{target_venue}補正]'
-
-        def highlight_with_t(row):
-            try:
-                lpi_rank = int(row.get('順位', 99) or 99)
-            except (TypeError, ValueError):
-                lpi_rank = 99
-            if lpi_rank == 1: return ['background-color: #F9A825; color: #000; font-weight:bold'] * len(row)
-            if lpi_rank == 2: return ['background-color: #1565C0; color: #fff; font-weight:bold'] * len(row)
-            if lpi_rank == 3: return ['background-color: #BF360C; color: #fff; font-weight:bold'] * len(row)
-            if lpi_rank <= 5: return ['background-color: #1B1B2F; color: #E0E0E0'] * len(row)
-            return [''] * len(row)
-
-        fmt = {lpi_col: '{:.1f}', 'LPI基本': '{:.1f}',
-               'LPI最高': '{:.1f}', 'LPI直近': '{:.1f}', '係数': '{:.2f}'}
-
-        st.dataframe(
-            result_df.style
-                .apply(highlight_with_t, axis=1)
-                .format(fmt, na_rep='-')
-                .set_properties(**{'border': '1px solid #444', 'font-size': '13px'})
-                .hide(axis='index'),
-            use_container_width=True,
-            height=min(600, 45 + len(rows) * 38),
-        )
-
-        buf = io.BytesIO()
-        result_df.to_excel(buf, index=False)
-        buf.seek(0)
-        st.download_button(
-            '📥 Excelダウンロード',
-            data=buf,
-            file_name=f'lpi_{race_name}.xlsx',
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        )
-
-    # ===== タブ2: グラフ =====
-    with tab2:
-        st.subheader('LPI ランキンググラフ')
-        fig = plot_ranking(results, race_name, target_venue)
-        st.pyplot(fig)
-
-        with st.expander('要素型の見方'):
-            st.markdown("""
-| 要素型 | 説明 | 東京係数 | 阪神係数 |
-|--------|------|---------|---------|
-| 🟢 ギアチェンジ | 後傾×差し+速上がり | **1.28** | **1.30** |
-| 🔵 ロンスパ・GC | 後傾×先行+速上がり | 1.20 | 1.29 |
-| 🟠 基礎スピード | 前傾×先行 | 0.77 | 1.05 |
-| 🔴 パワー・ロンスパ | 前傾×差し | 1.08 | 0.89 |
-| ⚫ ロンスパ | 後傾×差し+遅上がり | 0.44 | 0.39 |
-""")
-
-    # ===== タブ3: 過去走詳細 =====
-    with tab3:
-        st.subheader('過去走 詳細データ')
-        sel = st.selectbox('馬を選択', [r['horse'] for r in results])
-        hr  = next((r for r in results if r['horse'] == sel), None)
-
-        if hr:
-            col1, col2, col3, col4 = st.columns(4)
-            if hr.get('pos_pred'):
-                pp = hr['pos_pred']
-                st.markdown(
-                    f"**予測ポジション:** {pp['icon']} {pp['label']}　"
-                    f"予測地点差 **{pp['pred_gap']:.2f}秒**　"
-                    f"安定度: **{pp['confidence']}**（過去{pp['n_valid']}走 std={pp['gap_std']:.3f}）",
-                )
-            if hr.get('agari_pred'):
-                ap = hr['agari_pred']
-                pace_z_parts = []
-                for p, lbl in [('H','🔵ハイ'),('M','🟢ミドル'),('S','🟠スロー')]:
-                    z_val = ap['z_by_pace'].get(p)
-                    n_val = ap['n_by_pace'].get(p, 0)
-                    if z_val is not None:
-                        pace_z_parts.append(f'{lbl}: **{z_val:+.2f}** (n={n_val})')
-                    else:
-                        pace_z_parts.append(f'{lbl}: データなし')
-                pace_z_str = '　'.join(pace_z_parts)
-
-                st.markdown(
-                    f"**上がり予測:** {ap['grade_label']}　{ap['confidence']}　"
-                    f"予測上がり **{ap['pred_agari']}秒**（コース基準{ap['course_base']:.1f}秒）{ap.get('gap_note','')}\n\n"
-                    f"ペース帯別Z → {pace_z_str}\n\n"
-                    f"{ap['comment']}",
-                )
-            col1.metric('LPI補正', f"{hr['avg_venue_lpi']:.1f}")
-            col2.metric('LPI基本', f"{hr['avg_lpi']:.1f}")
-            col3.metric('要素型',  hr['dom_elem'])
-            col4.metric('有効走',  f"{hr['n_valid']}/{hr['n_total']}走（好走{hr['n_good']}）")
-
-            st.markdown('---')
-            run_rows = []
-            for rn in hr['runs']:
-                excl_reason = []
-                if rn.get('excluded_baba'):  excl_reason.append('重/不良')
-                if rn.get('excluded_track'): excl_reason.append('トラック違い')
-                run_rows.append({
-                    '走前':     rn.get('n', '-'),
-                    'レース名': rn.get('race', '-'),
-                    '競馬場':   rn.get('venue', '-'),
-                    '距離':     int(rn['dist']) if rn.get('dist') is not None else '-',
-                    '馬場':     rn.get('baba', '-'),
-                    'RPCI':     rn.get('rpci', '-'),
-                    '地点差':   rn.get('gap_est', '-'),
-                    '上がり':   rn.get('agari', '-'),
-                    '斤量補正': rn.get('wt_corr', 0.0),
-                    'Zスコア':  rn.get('z', '-'),
-                    'pb(位置補正)': rn.get('pb', 0.0),
-                    'hb(不利B)':   rn.get('hb', 0.0),
-                    'LPI':      rn.get('lpi', '-'),
-                    '要素型':   rn.get('elem', '-'),
-                    '前半速度Z': rn.get('front_pace_z', '-'),
-                    '除外':     '⚠️ ' + '/'.join(excl_reason) if excl_reason else '✅',
-                    '不利理由': rn.get('hb_r', ''),
+        race_no = int(line)
+        j = i + 2
+        found = False
+        class_text_parts = []
+        search_limit = min(j + 8, n)
+        while j < search_limit:
+            m = DIST_TRACK_RE.search(lines[j])
+            if m:
+                dist = float(m.group(1).replace(',', '').replace('，', ''))
+                track = 'D' if m.group(2) in ('ダート', 'ダ') else 'T'
+                race_class = classify_race_class(' '.join(class_text_parts))
+                results.append({
+                    'venue': current_venue or '(不明)',
+                    'race_no': race_no,
+                    'dist': dist,
+                    'track': track,
+                    'race_class': race_class,
                 })
+                found = True
+                j += 1
+                break
+            class_text_parts.append(lines[j])
+            j += 1
+        i = j if found else i + 1
 
-            run_df = pd.DataFrame(run_rows)
-
-            def highlight_run(row):
-                if row['除外'] != '✅':
-                    return ['opacity: 0.4; color: gray'] * len(row)
-                return [''] * len(row)
-
-            st.dataframe(
-                run_df.style
-                    .apply(highlight_run, axis=1)
-                    .format({'LPI': '{:.1f}', 'Zスコア': '{:.3f}',
-                             'pb(位置補正)': '{:.3f}', 'hb(不利B)': '{:.3f}',
-                             '斤量補正': '{:+.2f}'}),
-                use_container_width=True,
-            )
-
-    # ===== タブ4: モンテカルロシミュレーション =====
-    with tab4:
-        st.subheader('🎲 モンテカルロ シミュレーション')
-        st.warning(
-            '⚠️ 参考情報: このシミュレーション方式(予測地点差+予測上がりの絶対値を'
-            '足し合わせて順位を決める方式)は、2024-2025年バックテストで'
-            'LPIスコアによる順位付けより不安定という結果が出ています'
-            '(年によって精度の方向が逆転)。参考程度に留めてください。'
-        )
-        st.markdown(
-            '予測上がり・予測地点差の**誤差範囲でランダムにばらつかせて**1万回レースを試行し、'
-            '各馬の勝利確率・複勝確率を推定します。'
-        )
-
-        sim_horses = [(r['horse'],
-                       r['pos_pred']['pred_gap'],
-                       r['agari_pred']['pred_agari'])
-                      for r in results
-                      if r.get('pos_pred') and r.get('agari_pred')]
-        sim_stability = {
-            r['horse']: {
-                'agari_conf': r['agari_pred'].get('confidence','△不安定'),
-                'gap_conf':   r['pos_pred'].get('confidence','△不安定'),
-                'z_std':      r['agari_pred'].get('z_std', 0.5),
-                'gap_std':    r['pos_pred'].get('gap_std', 0.5),
-            }
-            for r in results if r.get('pos_pred') and r.get('agari_pred')
-        }
-
-        if len(sim_horses) < 2:
-            st.warning('予測ポジション・上がり予測が計算できた馬が2頭未満のため実行できません。')
-        else:
-            col_s1, col_s2 = st.columns(2)
-            with col_s1:
-                n_trials = st.select_slider(
-                    '試行回数',
-                    options=[1000, 3000, 5000, 10000],
-                    value=5000,
-                )
-            with col_s2:
-                show_top3 = st.checkbox('複勝確率（3着以内）も表示', value=True)
-
-            if st.button('▶️ シミュレーション実行', type='primary'):
-                names      = [h[0] for h in sim_horses]
-                pred_gaps  = np.array([h[1] for h in sim_horses])
-                pred_agari = np.array([h[2] for h in sim_horses])
-                pred_total = pred_gaps + pred_agari
-                n_horses   = len(names)
-
-                AGARI_BASE_STD = 1.065
-                GAP_BASE_STD   = 0.589
-
-                sigma_agari = np.array([
-                    max(0.5, min(2.0,
-                        r['agari_pred']['z_std'] * 1.4
-                        if r.get('agari_pred') and r['agari_pred'].get('z_std')
-                        else AGARI_BASE_STD))
-                    for r in results if r.get('pos_pred') and r.get('agari_pred')
-                ])
-                sigma_gap = np.array([
-                    max(0.1, min(1.2,
-                        r['pos_pred']['gap_std']
-                        if r.get('pos_pred') and r['pos_pred'].get('gap_std')
-                        else GAP_BASE_STD))
-                    for r in results if r.get('pos_pred') and r.get('agari_pred')
-                ])
-                z_stds = np.array([
-                    r['agari_pred']['z_std']
-                    if r.get('agari_pred') and r['agari_pred'].get('z_std')
-                    else 0.5
-                    for r in results if r.get('pos_pred') and r.get('agari_pred')
-                ])
-
-                wins  = np.zeros(n_horses)
-                top3s = np.zeros(n_horses)
-
-                np.random.seed(None)
-                with st.spinner(f'{n_trials:,}回シミュレーション中...'):
-                    for _ in range(n_trials):
-                        sim_gaps = np.maximum(0,
-                            pred_gaps + np.random.normal(0, sigma_gap))
-
-                        base_noise = np.random.normal(0, sigma_agari)
-                        for i in range(n_horses):
-                            if z_stds[i] > 0.7 and base_noise[i] < 0:
-                                base_noise[i] *= 0.5
-                        sim_agaris = pred_agari + base_noise
-
-                        sim_totals = sim_gaps + sim_agaris
-                        order      = np.argsort(sim_totals)
-                        wins[order[0]]   += 1
-                        top3s[order[:3]] += 1
-
-                sim_rows = []
-                for i in range(n_horses):
-                    wp = wins[i]  / n_trials * 100
-                    pp = top3s[i] / n_trials * 100
-                    lpi_rank = next((j+1 for j,r in enumerate(results) if r['horse']==names[i]), '-')
-                    stab = sim_stability.get(names[i], {})
-                    sim_rows.append({
-                        '勝利確率順':  i+1,
-                        '馬名':        names[i],
-                        'LPI順位':     lpi_rank,
-                        '予測通過T':   f'{pred_total[i]:.2f}秒',
-                        '上がり安定':  stab.get('agari_conf','-'),
-                        'gap安定':     stab.get('gap_conf','-'),
-                        '勝利確率':    f'{wp:.1f}%',
-                        '複勝確率':    f'{pp:.1f}%',
-                        '勝利回数':    int(wins[i]),
-                    })
-
-                sim_df = pd.DataFrame(sim_rows)
-                sim_df = sim_df.sort_values('勝利回数', ascending=False).reset_index(drop=True)
-                sim_df['勝利確率順'] = range(1, len(sim_df)+1)
-
-                def sim_highlight(row):
-                    rank = row['勝利確率順']
-                    if rank == 1: return ['background-color:#F9A825;color:#000;font-weight:bold']*len(row)
-                    if rank == 2: return ['background-color:#1565C0;color:#fff;font-weight:bold']*len(row)
-                    if rank == 3: return ['background-color:#BF360C;color:#fff;font-weight:bold']*len(row)
-                    return ['']*len(row)
-
-                display_cols = ['勝利確率順','馬名','LPI順位','予測通過T',
-                                '上がり安定','gap安定','勝利確率']
-                if show_top3:
-                    display_cols.append('複勝確率')
-
-                st.dataframe(
-                    sim_df[display_cols].style
-                        .apply(sim_highlight, axis=1)
-                        .hide(axis='index'),
-                    use_container_width=True,
-                    height=min(600, 45 + len(sim_df)*38),
-                )
-
-                st.caption(
-                    f'試行回数: {n_trials:,}回 ／ '
-                    f'上がりσ: 馬個別（z_std×1.4, 範囲0.5〜2.0秒）／ '
-                    f'地点差σ: 馬個別（gap_std, 範囲0.1〜1.2秒）／ '
-                    f'不安定馬（z_std>0.7）は速い方向のばらつきを半減'
-                )
-                st.info(
-                    '💡 勝利確率はLPI順位と異なる場合があります。'
-                    '予測通過Tが近い馬は誤差の影響を受けやすく、確率が均等に近くなります。'
-                    'LPI上位でも通過Tが遅い馬は勝利確率が低く出ます。'
-                )
-
-# ============================================================
-# フッター
-# ============================================================
-st.markdown('---')
-st.caption('LPI v11 | 展開ボーナス対応版 | 2024-2025年バックテスト済み設定 | 平場基準推奨 | 会場適性ボーナスON・G1好走ボーナスOFF既定')
-# ============================================================
-# フッター
-# ============================================================
-st.markdown('---')
-st.caption('LPI v11 | 展開ボーナス対応版 | 2024-2025年バックテスト済み設定 | 平場基準推奨 | 会場適性ボーナスON・G1好走ボーナスOFF既定')
-# ============================================================
-# フッター
-# ============================================================
-import re
-import io
-import pandas as pd
-import streamlit as st
+    return results
 
 
-# ============================================================
-# 1日厳選レース機能 v5
-# ------------------------------------------------------------
-# v4からの変更点(2024-2025年バックテストで検証済み):
-#   候補レースに以下4条件の複合フィルターを追加。
-#     1. 出走頭数が11頭以上（10頭以下は人気馬が安定しすぎて妙味が薄いため除外）
-#     2. 距離が1400m以下（短距離の方が人気馬が凡走しやすいことを確認済み）
-#     3. 東京を除外（人気馬の凡走率が全会場中最も低く、荒れにくいため）
-#     4. クラスが1勝クラス以上（未勝利・新馬を除外）
-#
-#   検証結果(2024-2025年・平場全芝・厳選3レース/日・軸+相手3頭流し):
-#     フィルタなし:               馬単回収率 88.7% / 馬連回収率 82.9%
-#     4条件複合フィルターあり:     馬単回収率127.2% / 馬連回収率143.0%
-#     (2024・2025年とも4指標すべてで一貫して改善を確認済み)
-#
-# 前提: daily_races_patch_v4.py の内容が適用済みであること
-#   (split_multi_race_csv, parse_jra_program, select_top_gap_races等)。
-# 既存の「1日厳選レース」機能ブロック全体を、この内容で置き換えてください。
-# ============================================================
+
 
 # ============================================================
 # クラス判定(未勝利・新馬・1勝〜3勝クラス・重賞等を区別する)
@@ -2061,278 +1540,902 @@ def select_top_gap_races(race_lpi_results, n_select=3, use_race_filter=True,
     return scored[:n_select]
 
 
-st.markdown('---')
-st.header('📅 1日厳選レース（v5: 頭数・距離・会場・クラスの複合フィルター対応）')
-st.caption(
-    '1日分の全レースが連結された出走表CSVを読み込み、JRA公式サイトの番組表とレース単位で対応づけたうえで、'
-    '検証済みの複合フィルター（頭数11頭以上・距離1400m以下・東京以外・1勝クラス以上）を満たすレースの中から、'
-    'LPI1位と2位のスコア差(gap)が最も大きい上位レースを自動選定します。'
-)
-st.info(
-    '💡 検証結果(2024-2025年・平場全芝・厳選3レース・軸+相手3頭流し):'
-    '複合フィルターなしの馬単回収率88.7%・馬連回収率82.9%に対し、'
-    'フィルターありでは馬単回収率127.2%・馬連回収率143.0%（2年間とも改善を確認済み）。'
-)
 
-with st.expander('📅 1日厳選レースを使う', expanded=False):
 
-    st.markdown('**① 出走表CSVをアップロード**')
-    col_a, col_b = st.columns(2)
-    with col_a:
-        daily_base_file = st.file_uploader(
-            '基準テーブル用CSV（平場水準のデータを推奨。重賞級のみだと較正がズレることを確認済み）',
-            type='csv', key='daily_base')
-    with col_b:
-        daily_multi_file = st.file_uploader(
-            'この日の全レース出走表CSV（枠番区切り形式）', type='csv', key='daily_multi')
+st.title('🏇 LPI v11 競馬予想ツール')
+st.caption('LPI (ラップ強さ指数) v11 — 展開ボーナス対応版。2024-2025年バックテスト済み設定を既定値として採用。')
 
-    col_c, col_d = st.columns(2)
-    with col_c:
-        daily_n_select = st.slider('厳選するレース数', 1, 10, 3, key='daily_n')
-    with col_d:
-        use_race_filter = st.checkbox(
-            '検証済みの複合フィルターを使う', value=True, key='daily_use_filter',
-            help='頭数11頭以上・距離1400m以下・東京以外・1勝クラス以上の4条件。'
-                 'オフにすると未勝利のみ除外した従来方式になります。'
-        )
+tab_single, tab_daily = st.tabs(['🔍 単一レース予想', '📅 1日厳選レース'])
 
-    with st.expander('複合フィルターの詳細設定（通常は変更不要）'):
-        filter_min_horses = st.number_input('最低頭数', min_value=1, max_value=18, value=11, key='filter_min_horses')
-        filter_max_dist = st.number_input('最大距離(m)', min_value=1000, max_value=3600, value=1400, step=100, key='filter_max_dist')
-        filter_exclude_tokyo = st.checkbox('東京を除外する', value=True, key='filter_exclude_tokyo')
-        filter_exclude_maiden_only = st.checkbox(
-            '未勝利・新馬のみ除外する(1勝クラス以上に絞らない)', value=False, key='filter_maiden_only',
-            help='オンにすると、2勝クラス以上等ではなく単に未勝利・新馬だけを除外する緩めの設定になります。'
-        )
+with tab_single:
 
-    n_partners = st.slider('相手の頭数（軸+相手のn点流し）', 2, 5, 3, key='daily_n_partners')
+    # ---- サイドバー ----
+    with st.sidebar:
+        st.header('⚙️ 設定')
 
-    st.markdown('---')
-    st.markdown(
-        '**② 番組表をコピペ**　'
-        '[JRA開催日程ページ](https://www.jra.go.jp/keiba/calendar/) '
-        'でその日を開き、会場ごとの表（会場名〜R番号〜クラス名〜距離〜芝ダ）をそのままコピー＆ペーストしてください。'
-        '複数会場ある場合は両方まとめて貼ってOKです。'
-    )
-    program_text = st.text_area(
-        '番組表テキスト', height=200, key='daily_program_text',
-        placeholder='JRA開催日程ページの表をそのままコピペ（例）:\n'
-                    '3回東京2日\nレース\n番号\nレース名・条件\t発走時刻\n'
-                    '1\nレース\n3歳未勝利\n1,400（ダ）（牝）\n10時05分\n'
-                    '2\nレース\n3歳未勝利\n2,100（ダ）\n10時35分\n...'
-    )
-    target_track_filter = st.radio('抽出するトラック', ['芝', 'ダート'], horizontal=True, key='daily_track_filter')
+        st.subheader('① 基準テーブル用CSV')
+        st.caption('⚠️ 平場（未勝利〜3勝クラス）水準のデータ推奨。重賞のみだと較正がズレます。')
+        base_file = st.file_uploader(
+            '2020〜2025年など、複数年分の平場結果CSVをアップ',
+            type='csv', key='base')
+        if base_file:
+            st.success(f'{base_file.name} 読み込み済み')
 
-    split_btn = st.button('③ CSV分割 + 番組表パース + 自動対応づけ', key='daily_split')
+        st.subheader('② 出走表CSV')
+        entry_file = st.file_uploader(
+            '予想するレースの出走表CSVをアップ',
+            type='csv', key='entry')
 
-    if split_btn:
-        if not daily_multi_file:
-            st.error('この日の全レース出走表CSVをアップロードしてください。')
-        elif not program_text.strip():
-            st.error('番組表テキストを貼り付けてください。')
+        st.subheader('③ レース設定')
+        race_name    = st.text_input('レース名', value='2026 レース名')
+        target_venue = st.selectbox(
+            '競馬場',
+            ['東京','中山','京都','阪神','中京','新潟','福島','小倉','札幌','函館'])
+        target_track = st.radio('トラック', ['T（芝）','D（ダート）'])
+        track_code   = 'T' if target_track.startswith('T') else 'D'
+        bonus_strength = st.slider(
+            '競馬場ボーナス強度', 0.0, 0.30, 0.15, 0.05,
+            help='0=ボーナスなし / 0.15=標準(検証済み・推奨) / 0.30=強め。'
+                 '検証済み: このボーナスを外すと馬単回収率が大幅に悪化します。')
+
+        st.subheader('④ ペース予測（自動判定・上書き可）')
+        race_dist = st.number_input('レース距離（m）', min_value=1000, max_value=3600, value=1600, step=200)
+
+        auto_pace = st.checkbox('出走馬の脚質から自動でペースを判定する', value=True,
+                                 help='検証済み(展開ボーナス): 各馬の過去走地点差から脚質を自動判定し、'
+                                      'ペース予測・展開適合ボーナスに反映します。')
+        if not auto_pace:
+            nige_count   = st.number_input('逃げ馬頭数', min_value=0, max_value=10, value=0, step=1)
+            senkou_count = st.number_input('先行馬頭数', min_value=0, max_value=16, value=0, step=1)
         else:
-            try:
-                races = split_multi_race_csv(daily_multi_file.read())
-                daily_multi_file.seek(0)
-            except Exception as e:
-                st.error(f'CSVの分割に失敗しました: {e}')
-                races = []
+            nige_count, senkou_count = 0, 0  # 自動判定時は実行時に上書きする
 
-            program = parse_jra_program(program_text)
-            track_code = 'T' if target_track_filter == '芝' else 'D'
-            program_filtered = [p for p in program if p['track'] == track_code]
-            program_filtered.sort(key=lambda p: (VENUE_NAMES.index(p['venue'])
-                                                   if p['venue'] in VENUE_NAMES else 99,
-                                                   p['race_no']))
+        use_pace_bonus = st.checkbox('展開適合ボーナスをLPIに反映する', value=True,
+                                      help='検証済み: 有効にすると馬単回収率70.8%→82.3%(2024-2025年バックテスト)')
+        pace_bonus_strength_input = st.slider('展開ボーナスの強さ', 0.0, 6.0, 3.0, 0.5,
+                                               disabled=not use_pace_bonus)
 
-            if not races:
-                st.warning('CSVからレースを検出できませんでした。')
-            elif not program_filtered:
-                st.warning('番組表から対象トラックのレースを検出できませんでした。テキストの形式を確認してください。')
+        st.markdown('**ペース直接指定（任意・自動判定を上書き）**')
+        manual_pace = st.radio(
+            'ペース帯を選択',
+            options=['自動推定（コース統計/脚質判定から）', '🔵 H（ハイ）', '🟢 M（ミドル）', '🟠 S（スロー）'],
+            index=0,
+            horizontal=False,
+        )
+        if '自動' in manual_pace:
+            manual_rpci = 0.0
+        elif 'H' in manual_pace:
+            manual_rpci = 45.0
+        elif 'M' in manual_pace:
+            manual_rpci = 51.0
+        else:
+            manual_rpci = 57.0
+
+        st.subheader('⑤ 好走ボーナス（既定オフ・検証済み）')
+        enable_g1_streak_bonus = st.checkbox(
+            'G1好走・連続好走ボーナスを使う', value=False,
+            help='検証済み: オフの方が馬連回収率が2024-2025年両年で一貫して良い結果でした'
+                 '(62.8%→65.6%, 94.2%→102.7%)。会場適性ボーナスとは別物です。'
+        )
+
+        st.subheader('⑥ PCI追走スコア（任意）')
+        use_pci_cs = st.checkbox(
+            '逃げ馬ペースへの追走能力を評価する',
+            value=False,
+        )
+        if use_pci_cs:
+            target_front_1f = st.number_input(
+                '逃げ馬の想定前半1F（秒）',
+                min_value=10.5, max_value=13.5, value=11.9, step=0.05,
+            )
+        else:
+            target_front_1f = None
+
+        st.subheader('⑦ クッション値（任意）')
+        use_cushion = st.checkbox('クッション値で基準上がりを補正する', value=False)
+        if use_cushion:
+            cushion_val = st.number_input('クッション値', min_value=5.0, max_value=14.0, value=9.0, step=0.1)
+            cushion_adj = round((9.0 - cushion_val) * 0.15, 3)
+            if cushion_adj > 0:
+                st.caption(f'クッション値{cushion_val:.1f} → 基準上がり{cushion_adj:+.2f}秒（遅い馬場）')
+            elif cushion_adj < 0:
+                st.caption(f'クッション値{cushion_val:.1f} → 基準上がり{cushion_adj:+.2f}秒（速い馬場）')
             else:
-                n_races, n_prog = len(races), len(program_filtered)
-                if n_races == n_prog:
-                    st.success(f'✅ CSV{n_races}レース分 と 番組表の{target_track_filter}レース{n_prog}件が一致しました。')
-                else:
-                    st.warning(
-                        f'⚠️ CSVは{n_races}レース分ですが、番組表から拾えた{target_track_filter}レースは{n_prog}件でした。'
-                        '対応がズレている可能性があるので、下の表で必ず確認してください。'
-                    )
+                st.caption('クッション値9.0 → 補正なし（標準）')
+        else:
+            cushion_val  = 9.0
+            cushion_adj  = 0.0
 
-                mapping_rows = []
-                for i, (block_no, block) in enumerate(races):
-                    p = program_filtered[i] if i < len(program_filtered) else None
-                    mapping_rows.append({
-                        'block_no': block_no,
-                        '頭数': len(block),
-                        '会場': p['venue'] if p else None,
-                        'R': p['race_no'] if p else None,
-                        '距離': p['dist'] if p else None,
-                        'トラック': track_code,
-                        'クラス': p['race_class'] if p else '不明',
+        run_btn = st.button('🔍 LPI計算実行', type='primary', use_container_width=True)
+
+    # ---- メインエリア ----
+    if not base_file:
+        st.info('← サイドバーから基準テーブル用CSVをアップしてください（平場水準のデータ推奨）。'
+                '基準テーブルだけで厳選レースを使いたい場合は「📅 1日厳選レース」タブへどうぞ。')
+    elif not entry_file:
+        st.info('← サイドバーから出走表CSVをアップしてください')
+    elif run_btn or (base_file and entry_file):
+        entry_bytes_for_pace = entry_file.read()
+        entry_file.seek(0)
+
+        # ---- ペース予測 ----
+        if manual_rpci > 0:
+            _mr = manual_rpci
+            if _mr <= 47:
+                _label, _lamp = 'ハイペース（直接指定）', '🔵'
+                _elem_adv = ['基礎スピード・パワー', 'パワー・ロンスパ']
+                _comment  = 'H（ハイ）指定 — 前半速く先行馬が消耗。基礎スピード型・差し馬有利'
+            elif _mr >= 54:
+                _label, _lamp = 'スローペース（直接指定）', '🟠'
+                _elem_adv = ['ギアチェンジ', 'ロンスパ・ギアチェンジ']
+                _comment  = 'S（スロー）指定 — 上がり勝負。GC型有利、先行馬の前残りも警戒'
+            else:
+                _label, _lamp = 'ミドルペース（直接指定）', '🟢'
+                _elem_adv = []
+                _comment  = 'M（ミドル）指定 — 平均的なペース。どちらも起こりうる'
+            pace = dict(pred_rpci=_mr, base_rpci=_mr, std=0.0,
+                        slow_pct=100 if _mr>=54 else 0,
+                        fast_pct=100 if _mr<=47 else 0,
+                        label=_label, lamp=_lamp,
+                        elem_adv=_elem_adv, comment=_comment)
+            auto_style_info = None
+        elif auto_pace:
+            # 展開ボーナス: 2パス構成(1パス目=脚質自動判定)
+            try:
+                auto_style_info = precompute_running_styles(entry_bytes_for_pace)
+                pace = get_pace_prediction(race_dist, target_venue,
+                                            auto_style_info['nige'], auto_style_info['senkou'])
+            except Exception as e:
+                st.warning(f'脚質自動判定に失敗したため手動値(0,0)で計算します: {e}')
+                auto_style_info = None
+                pace = get_pace_prediction(race_dist, target_venue, 0, 0)
+        else:
+            pace = get_pace_prediction(race_dist, target_venue, nige_count, senkou_count)
+            auto_style_info = None
+
+        with st.spinner('基準テーブルを構築中...'):
+            base_dict, 稍重_dict, race_base_dict = build_base_table(base_file.read())
+            base_file.seek(0)  # 再読み込みのためリセット
+
+        with st.spinner('LPI計算中...'):
+            results = calc_lpi(
+                entry_file.read(),
+                base_dict, 稍重_dict,
+                target_track=track_code,
+                target_venue=target_venue,
+                bonus_strength=bonus_strength,
+                pace_pred_rpci=pace['pred_rpci'],
+                race_base_dict=race_base_dict,
+                target_race_name=race_name,
+                target_front_1f_input=target_front_1f if use_pci_cs else None,
+                cushion_correction_input=cushion_adj if use_cushion else 0.0,
+                pace_elem_adv=pace['elem_adv'] if use_pace_bonus else None,
+                pace_bonus_strength=pace_bonus_strength_input if use_pace_bonus else 0.0,
+                disable_g1_streak_bonus=not enable_g1_streak_bonus,
+                target_dist=float(race_dist),
+            )
+
+        if not results:
+            st.error('計算できるデータがありませんでした。CSVの形式を確認してください。')
+            st.stop()
+
+        st.success(f'✅ {len(results)}頭 計算完了')
+
+        if auto_style_info:
+            st.caption(
+                f"🐎 脚質自動判定結果: 逃げ{auto_style_info['nige']}頭 / 先行{auto_style_info['senkou']}頭 / "
+                f"中団{auto_style_info['chudan']}頭 / 後方{auto_style_info['oikomi']}頭 / 不明{auto_style_info['fumei']}頭"
+            )
+
+        # ---- ペース予測バナー ----
+        lamp_color  = {'🟠': '#E65100', '🔵': '#0D47A1', '⚪': '#424242'}
+        border_color = {'🟠': '#FF6D00', '🔵': '#1565C0', '⚪': '#616161'}
+        bc  = lamp_color.get(pace['lamp'], '#424242')
+        brd = border_color.get(pace['lamp'], '#616161')
+
+        adv_html = ''
+        if pace['elem_adv']:
+            adv_html = '  有利な要素型: **' + ' / '.join(pace['elem_adv']) + '**'
+
+        cushion_html = ''
+        if use_cushion and cushion_adj != 0.0:
+            c_label = '軟らかめ' if cushion_val < 8 else ('やや軟らかめ' if cushion_val < 9 else ('やや硬め' if cushion_val < 11 else '硬め'))
+            cushion_html = f'　🌿 クッション値{cushion_val:.1f}({c_label}) → 基準上がり{cushion_adj:+.2f}秒補正'
+
+        st.markdown(
+            f"""<div style="background:{bc};border:2px solid {brd};border-radius:8px;
+            padding:12px 16px;margin:8px 0;font-size:13px;line-height:1.8;color:#FFFFFF;font-weight:500">
+            <b>{pace['lamp']} ペース予測: {pace['label']}</b>　
+            予測RPCI <b>{pace['pred_rpci']:.1f}</b>（基準{pace['base_rpci']:.1f}±{pace['std']:.1f}）<br>
+            スロー率 <b>{pace['slow_pct']}%</b>　ハイ率 <b>{pace['fast_pct']}%</b><br>
+            {pace['comment']}{adv_html}{cushion_html}
+            </div>""",
+            unsafe_allow_html=True
+        )
+
+        # ---- レース環境スコア（堅実軸）バナー ----
+        _race_grade = extract_grade(race_name)
+        race_env_score = calc_race_env_score(pace['pred_rpci'], race_dist, _race_grade, target_venue)
+        if race_env_score <= 1:
+            env_label = '🟢 堅実軸が機能しやすいレース'
+            env_detail = ('少頭数寄り・Sペース寄り・マイル以上・主要場グレード戦の傾向'
+                           'がそろっており、過去データではLPI上位馬の単勝回収率が高い（複勝率29.5%・回収率98.4%）。')
+            env_color, env_border = '#1B5E20', '#2E7D32'
+        elif race_env_score >= 3:
+            env_label = '🔴 紛れが起きやすいレース（LPI上位でも過信注意）'
+            env_detail = ('短距離・Hペース・G3・小場開催の条件が重なっており、'
+                           '過去データではLPI上位馬でも単勝回収率が下がる傾向（複勝率は同水準・回収率66.1%）。'
+                           'LPI下位の馬も含めて広めに見る方が無難。')
+            env_color, env_border = '#B71C1C', '#C62828'
+        else:
+            env_label = '🟡 標準的な紛れやすさのレース'
+            env_detail = '極端な傾向はない。通常通りLPI評価を参考にする。'
+            env_color, env_border = '#5D4037', '#6D4C41'
+
+        st.markdown(
+            f"""<div style="background:{env_color};border:2px solid {env_border};border-radius:8px;
+            padding:10px 16px;margin:4px 0 8px 0;font-size:12.5px;line-height:1.7;color:#FFFFFF;font-weight:500">
+            <b>{env_label}</b>（環境スコア{race_env_score}/4）<br>
+            {env_detail}
+            </div>""",
+            unsafe_allow_html=True
+        )
+
+        # ---- タブで表示 ----
+        tab1, tab2, tab3, tab4 = st.tabs(['📊 ランキング表', '📈 グラフ', '🔍 過去走詳細', '🎲 シミュレーション'])
+
+        # ===== タブ1: ランキング表 =====
+        with tab1:
+            st.subheader(f'{race_name}  LPI v11 ランキング')
+
+            pci_cs_map = {}
+            if use_pci_cs and target_front_1f:
+                for r in results:
+                    cs = calc_pci_cs(r.get('pci_cs_runs', []), target_front_1f)
+                    pci_cs_map[r['horse']] = cs
+
+            rows = []
+            for i, r in enumerate(results):
+                bonus_runs = [rn for rn in r['runs'] if rn.get('hb', 0) > 0]
+                bonus_str  = ' / '.join(
+                    [f"{rn.get('race','-')}({rn.get('hb_r','')})" for rn in bonus_runs])
+                g1_bonus_str = (f"+{r['g1_lpi_bonus']:.1f}({r['g1_bonus_detail']})"
+                               if r.get('g1_lpi_bonus', 0) > 0 else '-')
+                past  = [rn for rn in r['runs']
+                         if not rn.get('excluded_baba') and not rn.get('excluded_track')][:5]
+                plpi  = [round(rn['lpi'], 1) for rn in past]
+                while len(plpi) < 5: plpi.append('-')
+
+                delta = r.get('venue_delta', 0.0)
+                pace_match = r['dom_elem'] in pace['elem_adv'] if pace['elem_adv'] else None
+                pace_mark = '◎' if pace_match else ('△' if pace_match is False else '-')
+
+                if r.get('agari_pred'):
+                    ap = r['agari_pred']
+                    z_val   = round(ap['pred_z'], 3)
+                    grade   = ap['grade_label']
+                    conf    = ap['confidence']
+                    n_valid = ap['n_valid']
+                    n_disc  = ap.get('n_discounted', 0)
+                    hg_only = '★G1/G2限定' if ap.get('comment','') and 'G1/G2走' in ap.get('comment','') else ''
+                    matsu_str = f'{grade} {conf}  Z={z_val:+.3f}({n_valid}走{hg_only})'
+                else:
+                    matsu_str = '-'; z_val = '-'
+
+                pci_str = (pci_cs_map[r['horse']]['judge'] + ' ' +
+                           str(pci_cs_map[r['horse']]['score'])
+                           + '（' + pci_cs_map[r['horse']]['detail'][:15] + '）')                        if r['horse'] in pci_cs_map else '-'
+
+                if r.get('pos_pred'):
+                    pp = r['pos_pred']
+                    avg_gap = (sum(pp['past_gaps'])/len(pp['past_gaps'])
+                               if pp['past_gaps'] else pp['pred_gap'])
+                    pos_str = (f"{pp['icon']}{pp['zone_name']} {pp['confidence']}"
+                               f"  予測{pp['pred_gap']:.1f}秒（平均{avg_gap:.1f}秒）")
+                else:
+                    pos_str = '-'
+
+                pp = r.get('pos_pred')
+                if pp and pp.get('past_gaps'):
+                    gaps = pp['past_gaps']
+                    avg_gap = sum(gaps)/len(gaps)
+                    gap_label = ('🏇逃げ' if avg_gap<=0.1 else
+                                 '🔵先行' if avg_gap<=0.6 else
+                                 '🟡中団' if avg_gap<=1.2 else '🔴後方')
+                    past_pos_str = f'{gap_label} 平均{avg_gap:.1f}秒({len(gaps)}走)'
+                else:
+                    past_pos_str = '-'
+
+                if race_env_score <= 1 and (i + 1) <= 5:
+                    kentaku_str = '🟢堅実軸'
+                elif race_env_score >= 3 and (i + 1) <= 5:
+                    kentaku_str = '🔴過信注意'
+                else:
+                    kentaku_str = '-'
+
+                rows.append({
+                    '順位':           i + 1,
+                    '馬名':           r['horse'],
+                    f'LPI[{target_venue}補正]': r['avg_venue_lpi'],
+                    'LPI基本':        r['avg_lpi'],
+                    '展開適合':       pace_mark,
+                    'G1好走B':        g1_bonus_str,
+                    '要素型':         r['dom_elem'],
+                    '係数':           r['coef'],
+                    '有効/全走':      f"{r['n_valid']}/{r['n_total']}",
+                    '1走前':          plpi[0],
+                    '2走前':          plpi[1],
+                    '3走前':          plpi[2],
+                    '4走前':          plpi[3],
+                    '5走前':          plpi[4],
+                    'PCI追走':        pci_str,
+                    '末脚能力':       matsu_str,
+                    '過去ポジション':  past_pos_str,
+                    '不利ボーナス':   bonus_str,
+                    '堅実軸':         kentaku_str,
+                })
+
+            result_df = pd.DataFrame(rows)
+            lpi_col   = f'LPI[{target_venue}補正]'
+
+            def highlight_with_t(row):
+                try:
+                    lpi_rank = int(row.get('順位', 99) or 99)
+                except (TypeError, ValueError):
+                    lpi_rank = 99
+                if lpi_rank == 1: return ['background-color: #F9A825; color: #000; font-weight:bold'] * len(row)
+                if lpi_rank == 2: return ['background-color: #1565C0; color: #fff; font-weight:bold'] * len(row)
+                if lpi_rank == 3: return ['background-color: #BF360C; color: #fff; font-weight:bold'] * len(row)
+                if lpi_rank <= 5: return ['background-color: #1B1B2F; color: #E0E0E0'] * len(row)
+                return [''] * len(row)
+
+            fmt = {lpi_col: '{:.1f}', 'LPI基本': '{:.1f}',
+                   'LPI最高': '{:.1f}', 'LPI直近': '{:.1f}', '係数': '{:.2f}'}
+
+            st.dataframe(
+                result_df.style
+                    .apply(highlight_with_t, axis=1)
+                    .format(fmt, na_rep='-')
+                    .set_properties(**{'border': '1px solid #444', 'font-size': '13px'})
+                    .hide(axis='index'),
+                use_container_width=True,
+                height=min(600, 45 + len(rows) * 38),
+            )
+
+            buf = io.BytesIO()
+            result_df.to_excel(buf, index=False)
+            buf.seek(0)
+            st.download_button(
+                '📥 Excelダウンロード',
+                data=buf,
+                file_name=f'lpi_{race_name}.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            )
+
+        # ===== タブ2: グラフ =====
+        with tab2:
+            st.subheader('LPI ランキンググラフ')
+            fig = plot_ranking(results, race_name, target_venue)
+            st.pyplot(fig)
+
+            with st.expander('要素型の見方'):
+                st.markdown("""
+    | 要素型 | 説明 | 東京係数 | 阪神係数 |
+    |--------|------|---------|---------|
+    | 🟢 ギアチェンジ | 後傾×差し+速上がり | **1.28** | **1.30** |
+    | 🔵 ロンスパ・GC | 後傾×先行+速上がり | 1.20 | 1.29 |
+    | 🟠 基礎スピード | 前傾×先行 | 0.77 | 1.05 |
+    | 🔴 パワー・ロンスパ | 前傾×差し | 1.08 | 0.89 |
+    | ⚫ ロンスパ | 後傾×差し+遅上がり | 0.44 | 0.39 |
+    """)
+
+        # ===== タブ3: 過去走詳細 =====
+        with tab3:
+            st.subheader('過去走 詳細データ')
+            sel = st.selectbox('馬を選択', [r['horse'] for r in results])
+            hr  = next((r for r in results if r['horse'] == sel), None)
+
+            if hr:
+                col1, col2, col3, col4 = st.columns(4)
+                if hr.get('pos_pred'):
+                    pp = hr['pos_pred']
+                    st.markdown(
+                        f"**予測ポジション:** {pp['icon']} {pp['label']}　"
+                        f"予測地点差 **{pp['pred_gap']:.2f}秒**　"
+                        f"安定度: **{pp['confidence']}**（過去{pp['n_valid']}走 std={pp['gap_std']:.3f}）",
+                    )
+                if hr.get('agari_pred'):
+                    ap = hr['agari_pred']
+                    pace_z_parts = []
+                    for p, lbl in [('H','🔵ハイ'),('M','🟢ミドル'),('S','🟠スロー')]:
+                        z_val = ap['z_by_pace'].get(p)
+                        n_val = ap['n_by_pace'].get(p, 0)
+                        if z_val is not None:
+                            pace_z_parts.append(f'{lbl}: **{z_val:+.2f}** (n={n_val})')
+                        else:
+                            pace_z_parts.append(f'{lbl}: データなし')
+                    pace_z_str = '　'.join(pace_z_parts)
+
+                    st.markdown(
+                        f"**上がり予測:** {ap['grade_label']}　{ap['confidence']}　"
+                        f"予測上がり **{ap['pred_agari']}秒**（コース基準{ap['course_base']:.1f}秒）{ap.get('gap_note','')}\n\n"
+                        f"ペース帯別Z → {pace_z_str}\n\n"
+                        f"{ap['comment']}",
+                    )
+                col1.metric('LPI補正', f"{hr['avg_venue_lpi']:.1f}")
+                col2.metric('LPI基本', f"{hr['avg_lpi']:.1f}")
+                col3.metric('要素型',  hr['dom_elem'])
+                col4.metric('有効走',  f"{hr['n_valid']}/{hr['n_total']}走（好走{hr['n_good']}）")
+
+                st.markdown('---')
+                run_rows = []
+                for rn in hr['runs']:
+                    excl_reason = []
+                    if rn.get('excluded_baba'):  excl_reason.append('重/不良')
+                    if rn.get('excluded_track'): excl_reason.append('トラック違い')
+                    run_rows.append({
+                        '走前':     rn.get('n', '-'),
+                        'レース名': rn.get('race', '-'),
+                        '競馬場':   rn.get('venue', '-'),
+                        '距離':     int(rn['dist']) if rn.get('dist') is not None else '-',
+                        '馬場':     rn.get('baba', '-'),
+                        'RPCI':     rn.get('rpci', '-'),
+                        '地点差':   rn.get('gap_est', '-'),
+                        '上がり':   rn.get('agari', '-'),
+                        '斤量補正': rn.get('wt_corr', 0.0),
+                        'Zスコア':  rn.get('z', '-'),
+                        'pb(位置補正)': rn.get('pb', 0.0),
+                        'hb(不利B)':   rn.get('hb', 0.0),
+                        'LPI':      rn.get('lpi', '-'),
+                        '要素型':   rn.get('elem', '-'),
+                        '前半速度Z': rn.get('front_pace_z', '-'),
+                        '除外':     '⚠️ ' + '/'.join(excl_reason) if excl_reason else '✅',
+                        '不利理由': rn.get('hb_r', ''),
                     })
 
-                st.session_state['daily_races'] = races
-                st.session_state['daily_mapping_df'] = pd.DataFrame(mapping_rows)
+                run_df = pd.DataFrame(run_rows)
 
-    if 'daily_mapping_df' in st.session_state:
-        st.markdown('**④ 対応づけの確認・修正**（頭数・クラスを見て、明らかにおかしい対応は修正してください）')
-        edited_map = st.data_editor(
-            st.session_state['daily_mapping_df'],
-            column_config={
-                '会場': st.column_config.SelectboxColumn('会場', options=VENUE_NAMES),
-                'R': st.column_config.NumberColumn('R番号', min_value=1, max_value=12, step=1),
-                '距離': st.column_config.NumberColumn('距離(m)', min_value=800, max_value=3600, step=100),
-                'トラック': st.column_config.SelectboxColumn('トラック', options=['T', 'D']),
-                'クラス': st.column_config.SelectboxColumn(
-                    'クラス', options=['新馬', '未勝利', '1勝クラス', '2勝クラス', '3勝クラス',
-                                      'オープン特別等', 'G1', 'G2', 'G3', '不明']),
-            },
-            disabled=['block_no', '頭数'],
-            hide_index=True,
-            use_container_width=True,
-            key='daily_map_editor',
-        )
+                def highlight_run(row):
+                    if row['除外'] != '✅':
+                        return ['opacity: 0.4; color: gray'] * len(row)
+                    return [''] * len(row)
 
-        missing = edited_map['距離'].isna().sum() + edited_map['会場'].isna().sum()
-        if missing > 0:
-            st.warning(f'⚠️ 未確定の項目が{missing}件あります。表を編集して埋めてから計算してください。')
+                st.dataframe(
+                    run_df.style
+                        .apply(highlight_run, axis=1)
+                        .format({'LPI': '{:.1f}', 'Zスコア': '{:.3f}',
+                                 'pb(位置補正)': '{:.3f}', 'hb(不利B)': '{:.3f}',
+                                 '斤量補正': '{:+.2f}'}),
+                    use_container_width=True,
+                )
 
-        # フィルター条件に該当するレース数を事前表示
-        if use_race_filter:
-            allowed_cls = CLASS_1PLUS if not filter_exclude_maiden_only else (CLASS_1PLUS | {'新馬', '未勝利'} - {'未勝利', '新馬'})
-            # ↑ filter_exclude_maiden_onlyの時は「未勝利・新馬だけ除外」相当にする
-            if filter_exclude_maiden_only:
-                allowed_cls = {'1勝クラス','2勝クラス','3勝クラス','L','オープン特別等','G1','G2','G3','不明'}
-            n_pass = 0
-            for _, row in edited_map.iterrows():
-                venue_ex = {'東京'} if filter_exclude_tokyo else set()
-                if passes_race_filter(row['距離'], row['頭数'], row['会場'], row['クラス'],
-                                       min_horses=filter_min_horses, max_dist=filter_max_dist,
-                                       exclude_venues=venue_ex, allowed_classes=allowed_cls):
-                    n_pass += 1
-            st.caption(f'🔍 複合フィルター該当レース: {n_pass}件 / 全{len(edited_map)}件')
+        # ===== タブ4: モンテカルロシミュレーション =====
+        with tab4:
+            st.subheader('🎲 モンテカルロ シミュレーション')
+            st.warning(
+                '⚠️ 参考情報: このシミュレーション方式(予測地点差+予測上がりの絶対値を'
+                '足し合わせて順位を決める方式)は、2024-2025年バックテストで'
+                'LPIスコアによる順位付けより不安定という結果が出ています'
+                '(年によって精度の方向が逆転)。参考程度に留めてください。'
+            )
+            st.markdown(
+                '予測上がり・予測地点差の**誤差範囲でランダムにばらつかせて**1万回レースを試行し、'
+                '各馬の勝利確率・複勝確率を推定します。'
+            )
 
-        daily_run = st.button(
-            '⑤ 厳選レースを計算する', type='primary', key='daily_run',
-            disabled=(missing > 0),
-        )
+            sim_horses = [(r['horse'],
+                           r['pos_pred']['pred_gap'],
+                           r['agari_pred']['pred_agari'])
+                          for r in results
+                          if r.get('pos_pred') and r.get('agari_pred')]
+            sim_stability = {
+                r['horse']: {
+                    'agari_conf': r['agari_pred'].get('confidence','△不安定'),
+                    'gap_conf':   r['pos_pred'].get('confidence','△不安定'),
+                    'z_std':      r['agari_pred'].get('z_std', 0.5),
+                    'gap_std':    r['pos_pred'].get('gap_std', 0.5),
+                }
+                for r in results if r.get('pos_pred') and r.get('agari_pred')
+            }
 
-        if daily_run:
-            if not daily_base_file:
-                st.error('基準テーブルCSVをアップロードしてください。')
+            if len(sim_horses) < 2:
+                st.warning('予測ポジション・上がり予測が計算できた馬が2頭未満のため実行できません。')
             else:
-                with st.spinner('基準テーブルを構築中...'):
-                    d_base_dict, d_稍重_dict, d_race_base_dict = build_base_table(daily_base_file.read())
+                col_s1, col_s2 = st.columns(2)
+                with col_s1:
+                    n_trials = st.select_slider(
+                        '試行回数',
+                        options=[1000, 3000, 5000, 10000],
+                        value=5000,
+                    )
+                with col_s2:
+                    show_top3 = st.checkbox('複勝確率（3着以内）も表示', value=True)
 
-                races = st.session_state['daily_races']
-                map_by_block = {row['block_no']: row for _, row in edited_map.iterrows()}
+                if st.button('▶️ シミュレーション実行', type='primary'):
+                    names      = [h[0] for h in sim_horses]
+                    pred_gaps  = np.array([h[1] for h in sim_horses])
+                    pred_agari = np.array([h[2] for h in sim_horses])
+                    pred_total = pred_gaps + pred_agari
+                    n_horses   = len(names)
 
-                race_lpi_results = []
-                progress = st.progress(0)
-                for i, (block_no, block) in enumerate(races):
-                    m = map_by_block.get(block_no)
-                    if m is None:
-                        progress.progress((i + 1) / len(races))
-                        continue
+                    AGARI_BASE_STD = 1.065
+                    GAP_BASE_STD   = 0.589
 
-                    r_dist  = float(m['距離'])
-                    r_track = m['トラック'] or 'T'
-                    r_venue = m['会場']
-                    r_no    = int(m['R']) if pd.notna(m['R']) else None
-                    r_class = m['クラス']
+                    sigma_agari = np.array([
+                        max(0.5, min(2.0,
+                            r['agari_pred']['z_std'] * 1.4
+                            if r.get('agari_pred') and r['agari_pred'].get('z_std')
+                            else AGARI_BASE_STD))
+                        for r in results if r.get('pos_pred') and r.get('agari_pred')
+                    ])
+                    sigma_gap = np.array([
+                        max(0.1, min(1.2,
+                            r['pos_pred']['gap_std']
+                            if r.get('pos_pred') and r['pos_pred'].get('gap_std')
+                            else GAP_BASE_STD))
+                        for r in results if r.get('pos_pred') and r.get('agari_pred')
+                    ])
+                    z_stds = np.array([
+                        r['agari_pred']['z_std']
+                        if r.get('agari_pred') and r['agari_pred'].get('z_std')
+                        else 0.5
+                        for r in results if r.get('pos_pred') and r.get('agari_pred')
+                    ])
 
-                    try:
-                        csv_bytes = block.to_csv(index=False).encode('cp932', errors='replace')
+                    wins  = np.zeros(n_horses)
+                    top3s = np.zeros(n_horses)
 
-                        styles = precompute_running_styles(csv_bytes)
-                        pace = get_pace_prediction(r_dist, r_venue, styles.get('nige', 0), styles.get('senkou', 0))
+                    np.random.seed(None)
+                    with st.spinner(f'{n_trials:,}回シミュレーション中...'):
+                        for _ in range(n_trials):
+                            sim_gaps = np.maximum(0,
+                                pred_gaps + np.random.normal(0, sigma_gap))
 
-                        results = calc_lpi(
-                            csv_bytes, d_base_dict, d_稍重_dict,
-                            target_track=r_track, target_venue=r_venue,
-                            bonus_strength=0.15, pace_pred_rpci=pace['pred_rpci'],
-                            race_base_dict=d_race_base_dict,
-                            pace_elem_adv=pace['elem_adv'], pace_bonus_strength=3.0,
-                            target_dist=r_dist,
-                        )
-                        ranked = sorted(results, key=lambda x: -x['avg_venue_lpi'])
+                            base_noise = np.random.normal(0, sigma_agari)
+                            for i in range(n_horses):
+                                if z_stds[i] > 0.7 and base_noise[i] < 0:
+                                    base_noise[i] *= 0.5
+                            sim_agaris = pred_agari + base_noise
 
-                        if len(ranked) >= 2:
-                            race_lpi_results.append({
-                                'block_no': block_no, 'race_label': f'{r_venue}{r_no}R' if r_no else r_venue,
-                                'n_horses': len(ranked), 'ranked': ranked,
-                                'dist': r_dist, 'track': r_track, 'venue': r_venue,
-                                'class': r_class,
-                            })
-                    except Exception as e:
-                        st.caption(f'block{block_no}: 計算スキップ（{e}）')
-                    progress.progress((i + 1) / len(races))
+                            sim_totals = sim_gaps + sim_agaris
+                            order      = np.argsort(sim_totals)
+                            wins[order[0]]   += 1
+                            top3s[order[:3]] += 1
 
-                if not race_lpi_results:
-                    st.warning('LPIを計算できたレースがありませんでした。')
-                else:
-                    venue_ex = {'東京'} if filter_exclude_tokyo else set()
-                    allowed_cls = {'1勝クラス','2勝クラス','3勝クラス','L','オープン特別等','G1','G2','G3'}
-                    if filter_exclude_maiden_only:
-                        allowed_cls = allowed_cls | {'不明'}
+                    sim_rows = []
+                    for i in range(n_horses):
+                        wp = wins[i]  / n_trials * 100
+                        pp = top3s[i] / n_trials * 100
+                        lpi_rank = next((j+1 for j,r in enumerate(results) if r['horse']==names[i]), '-')
+                        stab = sim_stability.get(names[i], {})
+                        sim_rows.append({
+                            '勝利確率順':  i+1,
+                            '馬名':        names[i],
+                            'LPI順位':     lpi_rank,
+                            '予測通過T':   f'{pred_total[i]:.2f}秒',
+                            '上がり安定':  stab.get('agari_conf','-'),
+                            'gap安定':     stab.get('gap_conf','-'),
+                            '勝利確率':    f'{wp:.1f}%',
+                            '複勝確率':    f'{pp:.1f}%',
+                            '勝利回数':    int(wins[i]),
+                        })
 
-                    selected = select_top_gap_races(
-                        race_lpi_results, n_select=daily_n_select,
-                        use_race_filter=use_race_filter,
-                        min_horses=filter_min_horses, max_dist=filter_max_dist,
-                        exclude_venues=venue_ex, allowed_classes=allowed_cls,
+                    sim_df = pd.DataFrame(sim_rows)
+                    sim_df = sim_df.sort_values('勝利回数', ascending=False).reset_index(drop=True)
+                    sim_df['勝利確率順'] = range(1, len(sim_df)+1)
+
+                    def sim_highlight(row):
+                        rank = row['勝利確率順']
+                        if rank == 1: return ['background-color:#F9A825;color:#000;font-weight:bold']*len(row)
+                        if rank == 2: return ['background-color:#1565C0;color:#fff;font-weight:bold']*len(row)
+                        if rank == 3: return ['background-color:#BF360C;color:#fff;font-weight:bold']*len(row)
+                        return ['']*len(row)
+
+                    display_cols = ['勝利確率順','馬名','LPI順位','予測通過T',
+                                    '上がり安定','gap安定','勝利確率']
+                    if show_top3:
+                        display_cols.append('複勝確率')
+
+                    st.dataframe(
+                        sim_df[display_cols].style
+                            .apply(sim_highlight, axis=1)
+                            .hide(axis='index'),
+                        use_container_width=True,
+                        height=min(600, 45 + len(sim_df)*38),
                     )
 
-                    if use_race_filter and not selected:
+                    st.caption(
+                        f'試行回数: {n_trials:,}回 ／ '
+                        f'上がりσ: 馬個別（z_std×1.4, 範囲0.5〜2.0秒）／ '
+                        f'地点差σ: 馬個別（gap_std, 範囲0.1〜1.2秒）／ '
+                        f'不安定馬（z_std>0.7）は速い方向のばらつきを半減'
+                    )
+                    st.info(
+                        '💡 勝利確率はLPI順位と異なる場合があります。'
+                        '予測通過Tが近い馬は誤差の影響を受けやすく、確率が均等に近くなります。'
+                        'LPI上位でも通過Tが遅い馬は勝利確率が低く出ます。'
+                    )
+
+
+with tab_daily:
+    st.markdown('---')
+    st.header('📅 1日厳選レース（v5: 頭数・距離・会場・クラスの複合フィルター対応）')
+    st.caption(
+        '1日分の全レースが連結された出走表CSVを読み込み、JRA公式サイトの番組表とレース単位で対応づけたうえで、'
+        '検証済みの複合フィルター（頭数11頭以上・距離1400m以下・東京以外・1勝クラス以上）を満たすレースの中から、'
+        'LPI1位と2位のスコア差(gap)が最も大きい上位レースを自動選定します。'
+    )
+    st.info(
+        '💡 検証結果(2024-2025年・平場全芝・厳選3レース・軸+相手3頭流し):'
+        '複合フィルターなしの馬単回収率88.7%・馬連回収率82.9%に対し、'
+        'フィルターありでは馬単回収率127.2%・馬連回収率143.0%（2年間とも改善を確認済み）。'
+    )
+
+    with st.expander('📅 1日厳選レースを使う', expanded=False):
+
+        st.markdown('**① 出走表CSVをアップロード**')
+        col_a, col_b = st.columns(2)
+        with col_a:
+            daily_base_file = st.file_uploader(
+                '基準テーブル用CSV（平場水準のデータを推奨。重賞級のみだと較正がズレることを確認済み）',
+                type='csv', key='daily_base')
+        with col_b:
+            daily_multi_file = st.file_uploader(
+                'この日の全レース出走表CSV（枠番区切り形式）', type='csv', key='daily_multi')
+
+        col_c, col_d = st.columns(2)
+        with col_c:
+            daily_n_select = st.slider('厳選するレース数', 1, 10, 3, key='daily_n')
+        with col_d:
+            use_race_filter = st.checkbox(
+                '検証済みの複合フィルターを使う', value=True, key='daily_use_filter',
+                help='頭数11頭以上・距離1400m以下・東京以外・1勝クラス以上の4条件。'
+                     'オフにすると未勝利のみ除外した従来方式になります。'
+            )
+
+        with st.expander('複合フィルターの詳細設定（通常は変更不要）'):
+            filter_min_horses = st.number_input('最低頭数', min_value=1, max_value=18, value=11, key='filter_min_horses')
+            filter_max_dist = st.number_input('最大距離(m)', min_value=1000, max_value=3600, value=1400, step=100, key='filter_max_dist')
+            filter_exclude_tokyo = st.checkbox('東京を除外する', value=True, key='filter_exclude_tokyo')
+            filter_exclude_maiden_only = st.checkbox(
+                '未勝利・新馬のみ除外する(1勝クラス以上に絞らない)', value=False, key='filter_maiden_only',
+                help='オンにすると、2勝クラス以上等ではなく単に未勝利・新馬だけを除外する緩めの設定になります。'
+            )
+
+        n_partners = st.slider('相手の頭数（軸+相手のn点流し）', 2, 5, 3, key='daily_n_partners')
+
+        st.markdown('---')
+        st.markdown(
+            '**② 番組表をコピペ**　'
+            '[JRA開催日程ページ](https://www.jra.go.jp/keiba/calendar/) '
+            'でその日を開き、会場ごとの表（会場名〜R番号〜クラス名〜距離〜芝ダ）をそのままコピー＆ペーストしてください。'
+            '複数会場ある場合は両方まとめて貼ってOKです。'
+        )
+        program_text = st.text_area(
+            '番組表テキスト', height=200, key='daily_program_text',
+            placeholder='JRA開催日程ページの表をそのままコピペ（例）:\n'
+                        '3回東京2日\nレース\n番号\nレース名・条件\t発走時刻\n'
+                        '1\nレース\n3歳未勝利\n1,400（ダ）（牝）\n10時05分\n'
+                        '2\nレース\n3歳未勝利\n2,100（ダ）\n10時35分\n...'
+        )
+        target_track_filter = st.radio('抽出するトラック', ['芝', 'ダート'], horizontal=True, key='daily_track_filter')
+
+        split_btn = st.button('③ CSV分割 + 番組表パース + 自動対応づけ', key='daily_split')
+
+        if split_btn:
+            if not daily_multi_file:
+                st.error('この日の全レース出走表CSVをアップロードしてください。')
+            elif not program_text.strip():
+                st.error('番組表テキストを貼り付けてください。')
+            else:
+                try:
+                    races = split_multi_race_csv(daily_multi_file.read())
+                    daily_multi_file.seek(0)
+                except Exception as e:
+                    st.error(f'CSVの分割に失敗しました: {e}')
+                    races = []
+
+                program = parse_jra_program(program_text)
+                track_code = 'T' if target_track_filter == '芝' else 'D'
+                program_filtered = [p for p in program if p['track'] == track_code]
+                program_filtered.sort(key=lambda p: (VENUE_NAMES.index(p['venue'])
+                                                       if p['venue'] in VENUE_NAMES else 99,
+                                                       p['race_no']))
+
+                if not races:
+                    st.warning('CSVからレースを検出できませんでした。')
+                elif not program_filtered:
+                    st.warning('番組表から対象トラックのレースを検出できませんでした。テキストの形式を確認してください。')
+                else:
+                    n_races, n_prog = len(races), len(program_filtered)
+                    if n_races == n_prog:
+                        st.success(f'✅ CSV{n_races}レース分 と 番組表の{target_track_filter}レース{n_prog}件が一致しました。')
+                    else:
                         st.warning(
-                            '⚠️ 複合フィルターに該当するレースがありませんでした。'
-                            'フィルターをオフにするか、条件を緩めてください。'
+                            f'⚠️ CSVは{n_races}レース分ですが、番組表から拾えた{target_track_filter}レースは{n_prog}件でした。'
+                            '対応がズレている可能性があるので、下の表で必ず確認してください。'
                         )
 
-                    st.subheader(f'🏆 本日の厳選{len(selected)}レース（gap = LPI1位と2位のスコア差）')
-                    for s in selected:
-                        ranked = s['ranked']
-                        axis = ranked[0]
-                        partners = ranked[1:1 + n_partners]
-                        st.markdown(
-                            f"**{s['race_label']}**　{int(s['dist'])}m {s['track']}　{s['class']}　"
-                            f"gap = **{s['gap']:.1f}**　（出走{s['n_horses']}頭）"
-                        )
-                        rows = [{
-                            'LPI順位': 1, '馬名': axis['horse'],
-                            'LPI': axis['avg_venue_lpi'], '役割': '🎯 軸（1着固定）',
-                        }]
-                        for j, p in enumerate(partners, start=2):
-                            rows.append({
-                                'LPI順位': j, '馬名': p['horse'],
-                                'LPI': p['avg_venue_lpi'], '役割': '相手候補（2着）',
-                            })
-                        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-                        st.caption(
-                            f"馬単{n_partners}点: {axis['horse']} → "
-                            f"{' / '.join(p['horse'] for p in partners)}"
-                        )
-                        st.markdown('')
-
-                    st.subheader('📋 全レース一覧（gap順、複合フィルター適用状況つき）')
-                    all_rows = []
-                    for r in sorted(race_lpi_results,
-                                     key=lambda x: -(x['ranked'][0]['avg_venue_lpi'] - x['ranked'][1]['avg_venue_lpi'])):
-                        gap = r['ranked'][0]['avg_venue_lpi'] - r['ranked'][1]['avg_venue_lpi']
-                        is_selected = r['block_no'] in [s['block_no'] for s in selected]
-                        venue_ex_check = {'東京'} if filter_exclude_tokyo else set()
-                        passes = passes_race_filter(
-                            r['dist'], r['n_horses'], r['venue'], r['class'],
-                            min_horses=filter_min_horses, max_dist=filter_max_dist,
-                            exclude_venues=venue_ex_check, allowed_classes=allowed_cls,
-                        )
-                        all_rows.append({
-                            'レース': r['race_label'], 'クラス': r['class'], '距離': f"{int(r['dist'])}m",
-                            '出走頭数': r['n_horses'],
-                            'LPI1位': r['ranked'][0]['horse'], 'LPI2位': r['ranked'][1]['horse'],
-                            'gap': round(gap, 1),
-                            'フィルター該当': '✅' if passes else '-',
-                            '厳選対象': '🏆' if is_selected else '-',
+                    mapping_rows = []
+                    for i, (block_no, block) in enumerate(races):
+                        p = program_filtered[i] if i < len(program_filtered) else None
+                        mapping_rows.append({
+                            'block_no': block_no,
+                            '頭数': len(block),
+                            '会場': p['venue'] if p else None,
+                            'R': p['race_no'] if p else None,
+                            '距離': p['dist'] if p else None,
+                            'トラック': track_code,
+                            'クラス': p['race_class'] if p else '不明',
                         })
-                    st.dataframe(pd.DataFrame(all_rows), hide_index=True, use_container_width=True)
+
+                    st.session_state['daily_races'] = races
+                    st.session_state['daily_mapping_df'] = pd.DataFrame(mapping_rows)
+
+        if 'daily_mapping_df' in st.session_state:
+            st.markdown('**④ 対応づけの確認・修正**（頭数・クラスを見て、明らかにおかしい対応は修正してください）')
+            edited_map = st.data_editor(
+                st.session_state['daily_mapping_df'],
+                column_config={
+                    '会場': st.column_config.SelectboxColumn('会場', options=VENUE_NAMES),
+                    'R': st.column_config.NumberColumn('R番号', min_value=1, max_value=12, step=1),
+                    '距離': st.column_config.NumberColumn('距離(m)', min_value=800, max_value=3600, step=100),
+                    'トラック': st.column_config.SelectboxColumn('トラック', options=['T', 'D']),
+                    'クラス': st.column_config.SelectboxColumn(
+                        'クラス', options=['新馬', '未勝利', '1勝クラス', '2勝クラス', '3勝クラス',
+                                          'オープン特別等', 'G1', 'G2', 'G3', '不明']),
+                },
+                disabled=['block_no', '頭数'],
+                hide_index=True,
+                use_container_width=True,
+                key='daily_map_editor',
+            )
+
+            missing = edited_map['距離'].isna().sum() + edited_map['会場'].isna().sum()
+            if missing > 0:
+                st.warning(f'⚠️ 未確定の項目が{missing}件あります。表を編集して埋めてから計算してください。')
+
+            # フィルター条件に該当するレース数を事前表示
+            if use_race_filter:
+                allowed_cls = CLASS_1PLUS if not filter_exclude_maiden_only else (CLASS_1PLUS | {'不明'})
+                # ↑ filter_exclude_maiden_onlyの時は「未勝利・新馬だけ除外」相当にする
+                if filter_exclude_maiden_only:
+                    allowed_cls = {'1勝クラス','2勝クラス','3勝クラス','L','オープン特別等','G1','G2','G3','不明'}
+                n_pass = 0
+                for _, row in edited_map.iterrows():
+                    venue_ex = {'東京'} if filter_exclude_tokyo else set()
+                    if passes_race_filter(row['距離'], row['頭数'], row['会場'], row['クラス'],
+                                           min_horses=filter_min_horses, max_dist=filter_max_dist,
+                                           exclude_venues=venue_ex, allowed_classes=allowed_cls):
+                        n_pass += 1
+                st.caption(f'🔍 複合フィルター該当レース: {n_pass}件 / 全{len(edited_map)}件')
+
+            daily_run = st.button(
+                '⑤ 厳選レースを計算する', type='primary', key='daily_run',
+                disabled=(missing > 0),
+            )
+
+            if daily_run:
+                if not daily_base_file:
+                    st.error('基準テーブルCSVをアップロードしてください。')
+                else:
+                    with st.spinner('基準テーブルを構築中...'):
+                        d_base_dict, d_稍重_dict, d_race_base_dict = build_base_table(daily_base_file.read())
+
+                    races = st.session_state['daily_races']
+                    map_by_block = {row['block_no']: row for _, row in edited_map.iterrows()}
+
+                    race_lpi_results = []
+                    progress = st.progress(0)
+                    for i, (block_no, block) in enumerate(races):
+                        m = map_by_block.get(block_no)
+                        if m is None:
+                            progress.progress((i + 1) / len(races))
+                            continue
+
+                        r_dist  = float(m['距離'])
+                        r_track = m['トラック'] or 'T'
+                        r_venue = m['会場']
+                        r_no    = int(m['R']) if pd.notna(m['R']) else None
+                        r_class = m['クラス']
+
+                        try:
+                            csv_bytes = block.to_csv(index=False).encode('cp932', errors='replace')
+
+                            styles = precompute_running_styles(csv_bytes)
+                            pace = get_pace_prediction(r_dist, r_venue, styles.get('nige', 0), styles.get('senkou', 0))
+
+                            results = calc_lpi(
+                                csv_bytes, d_base_dict, d_稍重_dict,
+                                target_track=r_track, target_venue=r_venue,
+                                bonus_strength=0.15, pace_pred_rpci=pace['pred_rpci'],
+                                race_base_dict=d_race_base_dict,
+                                pace_elem_adv=pace['elem_adv'], pace_bonus_strength=3.0,
+                                target_dist=r_dist,
+                            )
+                            ranked = sorted(results, key=lambda x: -x['avg_venue_lpi'])
+
+                            if len(ranked) >= 2:
+                                race_lpi_results.append({
+                                    'block_no': block_no, 'race_label': f'{r_venue}{r_no}R' if r_no else r_venue,
+                                    'n_horses': len(ranked), 'ranked': ranked,
+                                    'dist': r_dist, 'track': r_track, 'venue': r_venue,
+                                    'class': r_class,
+                                })
+                        except Exception as e:
+                            st.caption(f'block{block_no}: 計算スキップ（{e}）')
+                        progress.progress((i + 1) / len(races))
+
+                    if not race_lpi_results:
+                        st.warning('LPIを計算できたレースがありませんでした。')
+                    else:
+                        venue_ex = {'東京'} if filter_exclude_tokyo else set()
+                        allowed_cls = {'1勝クラス','2勝クラス','3勝クラス','L','オープン特別等','G1','G2','G3'}
+                        if filter_exclude_maiden_only:
+                            allowed_cls = allowed_cls | {'不明'}
+
+                        selected = select_top_gap_races(
+                            race_lpi_results, n_select=daily_n_select,
+                            use_race_filter=use_race_filter,
+                            min_horses=filter_min_horses, max_dist=filter_max_dist,
+                            exclude_venues=venue_ex, allowed_classes=allowed_cls,
+                        )
+
+                        if use_race_filter and not selected:
+                            st.warning(
+                                '⚠️ 複合フィルターに該当するレースがありませんでした。'
+                                'フィルターをオフにするか、条件を緩めてください。'
+                            )
+
+                        st.subheader(f'🏆 本日の厳選{len(selected)}レース（gap = LPI1位と2位のスコア差）')
+                        for s in selected:
+                            ranked = s['ranked']
+                            axis = ranked[0]
+                            partners = ranked[1:1 + n_partners]
+                            st.markdown(
+                                f"**{s['race_label']}**　{int(s['dist'])}m {s['track']}　{s['class']}　"
+                                f"gap = **{s['gap']:.1f}**　（出走{s['n_horses']}頭）"
+                            )
+                            rows = [{
+                                'LPI順位': 1, '馬名': axis['horse'],
+                                'LPI': axis['avg_venue_lpi'], '役割': '🎯 軸（1着固定）',
+                            }]
+                            for j, p in enumerate(partners, start=2):
+                                rows.append({
+                                    'LPI順位': j, '馬名': p['horse'],
+                                    'LPI': p['avg_venue_lpi'], '役割': '相手候補（2着）',
+                                })
+                            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                            st.caption(
+                                f"馬単{n_partners}点: {axis['horse']} → "
+                                f"{' / '.join(p['horse'] for p in partners)}"
+                            )
+                            st.markdown('')
+
+                        st.subheader('📋 全レース一覧（gap順、複合フィルター適用状況つき）')
+                        all_rows = []
+                        for r in sorted(race_lpi_results,
+                                         key=lambda x: -(x['ranked'][0]['avg_venue_lpi'] - x['ranked'][1]['avg_venue_lpi'])):
+                            gap = r['ranked'][0]['avg_venue_lpi'] - r['ranked'][1]['avg_venue_lpi']
+                            is_selected = r['block_no'] in [s['block_no'] for s in selected]
+                            venue_ex_check = {'東京'} if filter_exclude_tokyo else set()
+                            passes = passes_race_filter(
+                                r['dist'], r['n_horses'], r['venue'], r['class'],
+                                min_horses=filter_min_horses, max_dist=filter_max_dist,
+                                exclude_venues=venue_ex_check, allowed_classes=allowed_cls,
+                            )
+                            all_rows.append({
+                                'レース': r['race_label'], 'クラス': r['class'], '距離': f"{int(r['dist'])}m",
+                                '出走頭数': r['n_horses'],
+                                'LPI1位': r['ranked'][0]['horse'], 'LPI2位': r['ranked'][1]['horse'],
+                                'gap': round(gap, 1),
+                                'フィルター該当': '✅' if passes else '-',
+                                '厳選対象': '🏆' if is_selected else '-',
+                            })
+                        st.dataframe(pd.DataFrame(all_rows), hide_index=True, use_container_width=True)
+
+# ============================================================
+# フッター
+# ============================================================
+st.markdown('---')
+st.caption('LPI v11 | 展開ボーナス対応版 | 2024-2025年バックテスト済み設定 | 平場基準推奨 | 会場適性ボーナスON・G1好走ボーナスOFF既定')
