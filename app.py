@@ -1672,12 +1672,30 @@ def github_log_configured():
         return False
 
 
-def github_get_log():
-    """GitHub上の既存ログを取得する。無ければ(None, None)を返す。"""
+def github_snapshot_configured():
+    """st.secretsに「本日の厳選結果」スナップショット保存用の設定が揃っているか。
+    GITHUB_TODAY_PATH が未設定でも、GITHUB_TOKEN/GITHUB_REPOがあれば既定パスを使う。
+    """
+    try:
+        return all(k in st.secrets for k in ('GITHUB_TOKEN', 'GITHUB_REPO'))
+    except Exception:
+        return False
+
+
+def _github_path(path=None):
+    if path:
+        return path
+    return st.secrets.get('GITHUB_TODAY_PATH', 'logs/today_selection.json')
+
+
+def github_get_log(path=None):
+    """GitHub上の既存ファイルを取得する。無ければ(None, None)を返す。
+    path未指定時は st.secrets['GITHUB_LOG_PATH'](ログ機能の既定パス)を使う。
+    """
     token = st.secrets['GITHUB_TOKEN']
     repo = st.secrets['GITHUB_REPO']
-    path = st.secrets['GITHUB_LOG_PATH']
-    url = f'https://api.github.com/repos/{repo}/contents/{path}'
+    use_path = path or st.secrets['GITHUB_LOG_PATH']
+    url = f'https://api.github.com/repos/{repo}/contents/{use_path}'
     headers = {'Authorization': f'token {token}', 'Accept': 'application/vnd.github+json'}
     resp = requests.get(url, headers=headers, timeout=15)
     if resp.status_code == 200:
@@ -1690,12 +1708,14 @@ def github_get_log():
         raise RuntimeError(f'GitHub取得エラー: {resp.status_code} {resp.text[:200]}')
 
 
-def github_update_log(new_content_str, sha, message='update lpi log'):
-    """GitHub上のログファイルを新しい内容で上書き(またはsha未指定なら新規作成)する。"""
+def github_update_log(new_content_str, sha, message='update lpi log', path=None):
+    """GitHub上のファイルを新しい内容で上書き(またはsha未指定なら新規作成)する。
+    path未指定時は st.secrets['GITHUB_LOG_PATH'](ログ機能の既定パス)を使う。
+    """
     token = st.secrets['GITHUB_TOKEN']
     repo = st.secrets['GITHUB_REPO']
-    path = st.secrets['GITHUB_LOG_PATH']
-    url = f'https://api.github.com/repos/{repo}/contents/{path}'
+    use_path = path or st.secrets['GITHUB_LOG_PATH']
+    url = f'https://api.github.com/repos/{repo}/contents/{use_path}'
     headers = {'Authorization': f'token {token}', 'Accept': 'application/vnd.github+json'}
     content_b64 = base64.b64encode(new_content_str.encode('utf-8-sig')).decode('ascii')
     payload = {'message': message, 'content': content_b64}
@@ -1705,6 +1725,25 @@ def github_update_log(new_content_str, sha, message='update lpi log'):
     if resp.status_code not in (200, 201):
         raise RuntimeError(f'GitHub更新エラー: {resp.status_code} {resp.text[:200]}')
     return resp.json()
+
+
+def github_save_snapshot(snapshot_dict):
+    """本日の厳選レース結果(dict)をJSONとしてGitHubに保存する(常に上書き=最新1回分のみ保持)。"""
+    import json
+    path = _github_path()
+    _, sha = github_get_log(path=path)
+    content_str = json.dumps(snapshot_dict, ensure_ascii=False, indent=2)
+    github_update_log(content_str, sha, message=f'update today snapshot ({snapshot_dict.get("saved_at","")})', path=path)
+
+
+def github_load_snapshot():
+    """GitHubに保存されている本日の厳選レース結果(dict)を取得する。無ければNone。"""
+    import json
+    path = _github_path()
+    content, _ = github_get_log(path=path)
+    if content is None:
+        return None
+    return json.loads(content)
 
 
 def parse_dn_file(dn_bytes):
@@ -2394,6 +2433,45 @@ with tab_daily:
         'フィルターありでは馬単回収率127.2%・馬連回収率143.0%（2年間とも改善を確認済み）。'
     )
 
+    # ============================================================
+    # 📱 保存済みの本日の結果を見る(PCで計算→外出先のスマホ等で確認する用)
+    # ------------------------------------------------------------
+    # ファイルアップロードや計算が一切不要。GitHubに保存済みのスナップショットを
+    # 取得して表示するだけなので、iPhone等のブラウザからでもこのボタン1つで見られる。
+    # ============================================================
+    st.markdown('### 📱 保存済みの本日の結果を見る')
+    st.caption('PC側で計算・保存しておけば、外出先のスマホからはこのボタンを押すだけで内容を確認できます（再計算は不要）。')
+
+    if not github_snapshot_configured():
+        st.warning(
+            '⚠️ GitHub保存が設定されていないため、この機能は使えません。'
+            'Streamlit Cloudの Settings → Secrets に GITHUB_TOKEN と GITHUB_REPO を設定してください'
+            '（下の「本日の結果を保存する」欄でも同じ設定を使います）。'
+        )
+    else:
+        if st.button('🔄 保存済みの結果を読み込む', key='load_snapshot_btn'):
+            try:
+                snapshot = github_load_snapshot()
+            except Exception as e:
+                st.error(f'読み込みに失敗しました: {e}')
+                snapshot = None
+            if snapshot is None:
+                st.info('まだ保存された結果がありません。PCで計算後に「本日の結果を保存する」を実行してください。')
+            else:
+                st.success(f"✅ {snapshot.get('saved_at', '(保存時刻不明)')} に保存された結果です。")
+                for s in snapshot.get('races', []):
+                    st.markdown(
+                        f"**{s['race_label']}**　{s['dist']}m {s['track']}　{s['class']}　"
+                        f"gap = **{s['gap']:.1f}**　（出走{s['n_horses']}頭）"
+                    )
+                    rows = [{'LPI順位': 1, '馬名': s['axis']['horse'], 'LPI': s['axis']['lpi'], '役割': '🎯 軸（1着固定）'}]
+                    for j, p in enumerate(s.get('partners', []), start=2):
+                        rows.append({'LPI順位': j, '馬名': p['horse'], 'LPI': p['lpi'], '役割': '相手候補（2着）'})
+                    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                    partner_names = [p['horse'] for p in s.get('partners', [])]
+                    st.caption(f"馬単: {s['axis']['horse']} → {' / '.join(partner_names)}")
+                    st.markdown('')
+
     with st.expander('📅 1日厳選レースを使う', expanded=False):
 
         st.markdown('**① 過去走データファイルをアップロード**')
@@ -2693,6 +2771,33 @@ with tab_daily:
 
                     st.session_state['daily_selected_for_log'] = selected
                     st.session_state['daily_n_partners_for_log'] = n_partners
+
+                    if github_snapshot_configured():
+                        if st.button('💾 本日の結果を保存する（他の端末からも見られるようにする）', key='save_snapshot_btn'):
+                            import datetime
+                            snapshot = {
+                                'saved_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M'),
+                                'races': [
+                                    {
+                                        'race_label': s['race_label'], 'dist': int(s['dist']),
+                                        'track': s['track'], 'class': s['class'],
+                                        'gap': s['gap'], 'n_horses': s['n_horses'],
+                                        'axis': {'horse': s['ranked'][0]['horse'], 'lpi': s['ranked'][0]['avg_venue_lpi']},
+                                        'partners': [
+                                            {'horse': p['horse'], 'lpi': p['avg_venue_lpi']}
+                                            for p in s['ranked'][1:1 + n_partners]
+                                        ],
+                                    }
+                                    for s in selected
+                                ],
+                            }
+                            try:
+                                github_save_snapshot(snapshot)
+                                st.success('✅ 保存しました。他の端末からは、このタブ上部の「保存済みの本日の結果を見る」で確認できます。')
+                            except Exception as e:
+                                st.error(f'保存に失敗しました: {e}')
+                    else:
+                        st.caption('💡 GitHub保存を設定すると、この結果を他の端末（スマホ等）からも確認できるようになります。')
 
                     st.subheader('📋 全レース一覧（gap順、複合フィルター適用状況つき）')
                     all_rows = []
