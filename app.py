@@ -1663,6 +1663,7 @@ def parse_dn_file(dn_bytes):
 
         entries = DN_ENTRY_RE.findall(body)
         races.append({
+            'date': f'{year}{int(month):02d}{int(day):02d}',
             'venue': venue, 'race_no': race_no, 'race_name': race_name_raw.strip(),
             'race_class': classify_race_class(race_name_raw),
             'track': track, 'dist': dist, 'n_horses': n_horses,
@@ -2496,7 +2497,7 @@ with tab_daily:
                                     'block_no': i, 'race_label': f'{r_venue}{r_no}R' if r_no else r_venue,
                                     'n_horses': len(ranked), 'ranked': ranked,
                                     'dist': r_dist, 'track': r_track, 'venue': r_venue,
-                                    'class': r_class,
+                                    'class': r_class, 'date': race.get('date'), 'race_no': r_no,
                                 })
                         except Exception as e:
                             st.caption(f'block{i}: 計算スキップ（{e}）')
@@ -2548,6 +2549,9 @@ with tab_daily:
                             )
                             st.markdown('')
 
+                        st.session_state['daily_selected_for_log'] = selected
+                        st.session_state['daily_n_partners_for_log'] = n_partners
+
                         st.subheader('📋 全レース一覧（gap順、複合フィルター適用状況つき）')
                         all_rows = []
                         for r in sorted(race_lpi_results,
@@ -2569,6 +2573,89 @@ with tab_daily:
                                 '厳選対象': '🏆' if is_selected else '-',
                             })
                         st.dataframe(pd.DataFrame(all_rows), hide_index=True, use_container_width=True)
+
+                        # ============================================================
+                        # ログ記録セクション
+                        # ------------------------------------------------------------
+                        # Streamlit Cloud等はファイルシステムが再起動で消えるため、
+                        # 「既存ログCSVをアップロード → 今回の結果を追記 → ダウンロード」
+                        # という手元管理型にしている。ダウンロードしたファイルを
+                        # 次回また①でアップロードすれば、履歴が積み上がっていく。
+                        # ============================================================
+                        st.markdown('---')
+                        st.subheader('📝 ログに記録する')
+                        st.caption(
+                            '今回の厳選レースを記録します。着順・配当は後で結果が出てから'
+                            'ダウンロードしたCSVを直接編集して埋めてください（この欄では空欄のまま出力します）。'
+                        )
+                        existing_log_file = st.file_uploader(
+                            '既存のログCSV（あれば）。無ければ空のまま次に進んでOKです。',
+                            type='csv', key='daily_log_upload'
+                        )
+
+                        if st.button('📝 今回の結果をログに追加してダウンロード', key='daily_log_append'):
+                            log_rows = []
+                            for s in selected:
+                                ranked = s['ranked']
+                                axis = ranked[0]
+                                partners = ranked[1:1 + n_partners]
+                                log_rows.append({
+                                    '日付': s.get('date', ''),
+                                    '会場': s.get('venue', ''),
+                                    'R': s.get('race_no', ''),
+                                    'クラス': s.get('class', ''),
+                                    '距離': s.get('dist', ''),
+                                    'トラック': s.get('track', ''),
+                                    '出走頭数': s.get('n_horses', ''),
+                                    'gap': round(s.get('gap', 0), 1),
+                                    '軸': axis['horse'],
+                                    '軸LPI': axis['avg_venue_lpi'],
+                                    '相手1': partners[0]['horse'] if len(partners) > 0 else '',
+                                    '相手2': partners[1]['horse'] if len(partners) > 1 else '',
+                                    '相手3': partners[2]['horse'] if len(partners) > 2 else '',
+                                    '相手4': partners[3]['horse'] if len(partners) > 3 else '',
+                                    '実際1着': '',   # 後で手入力
+                                    '実際2着': '',   # 後で手入力
+                                    '馬単的中': '',   # 後で手入力(○/×)
+                                    '馬単配当': '',   # 後で手入力
+                                    '馬連的中': '',   # 後で手入力(○/×)
+                                    '馬連配当': '',   # 後で手入力
+                                    'メモ': '',
+                                })
+                            new_log_df = pd.DataFrame(log_rows)
+
+                            if existing_log_file is not None:
+                                try:
+                                    old_log_df = pd.read_csv(existing_log_file, encoding='utf-8-sig')
+                                except Exception:
+                                    existing_log_file.seek(0)
+                                    old_log_df = pd.read_csv(existing_log_file, encoding='cp932')
+                                combined_log_df = pd.concat([old_log_df, new_log_df], ignore_index=True)
+                                combined_log_df = combined_log_df.drop_duplicates(
+                                    subset=['日付', '会場', 'R', '軸'], keep='last'
+                                )
+                                st.success(
+                                    f'既存ログ{len(old_log_df)}件 + 今回{len(new_log_df)}件 '
+                                    f'= 合計{len(combined_log_df)}件（重複日付･会場･R･軸は最新で上書き）'
+                                )
+                            else:
+                                combined_log_df = new_log_df
+                                st.success(f'新規ログを作成しました（{len(new_log_df)}件）')
+
+                            st.dataframe(combined_log_df, hide_index=True, use_container_width=True)
+
+                            log_csv_bytes = combined_log_df.to_csv(index=False).encode('utf-8-sig')
+                            st.download_button(
+                                '📥 ログCSVをダウンロード',
+                                data=log_csv_bytes,
+                                file_name=f'lpi_log_{selected[0].get("date", "unknown") if selected else "unknown"}.csv',
+                                mime='text/csv',
+                                key='daily_log_download',
+                            )
+                            st.caption(
+                                '⚠️ このファイルを保存しておき、次回はここの「既存のログCSV」に'
+                                'アップロードしてから同じ操作をすると、履歴が積み上がっていきます。'
+                            )
 
 # ============================================================
 # フッター
